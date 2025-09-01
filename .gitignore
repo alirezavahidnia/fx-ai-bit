@@ -1,12 +1,15 @@
-# Ignore environment files
+# secrets
 .env
 *.env
+config.yaml
 
-# Ignore virtual environment
+# venv & logs
 .venv/
 venv/
+logs/
+*.log
 
-# Ignore Python cache & build junk
+# Python build/bytecode
 __pycache__/
 *.pyc
 *.pyo
@@ -15,6 +18,3 @@ __pycache__/
 dist/
 build/
 
-# Ignore logs
-*.log
-logs/
