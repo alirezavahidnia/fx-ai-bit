@@ -192,10 +192,12 @@ def place_market_order(symbol: str, side: int, lots: float, sl: float | None=Non
 def _tg_creds(cfg):
     a = cfg.get("alerts", {}) or {}
     if not a.get("telegram_enabled", False):
+        logger.debug("Telegram disabled in config.")
         return None, None
     token = os.getenv(a.get("telegram_bot_token_env", ""))
     chat_id = os.getenv(a.get("telegram_chat_id_env", ""))
     if not token or not chat_id:
+        logger.warning("Telegram creds missing: token/chat_id not found in env.")
         return None, None
     return token, chat_id
 
@@ -209,9 +211,67 @@ def send_telegram_alert(cfg: dict, text: str) -> bool:
             params={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=10,
         )
+        if not r.ok:
+            logger.error(f"Telegram send failed: {r.status_code} {r.text}")
+        else:
+            logger.debug("Telegram alert sent.")
         return r.ok
-    except Exception:
+    except Exception as e:
+        logger.exception(f"Telegram send exception: {e}")
         return False
+
+def build_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, symbols: list[str]) -> dict:
+    """
+    Read MT5 deal history for [start_ts, end_ts] and compute a net P/L summary for our bot.
+    Net = profit + commission + swap for DEAL_ENTRY_OUT on our symbols,
+    filtering to our MAGIC or our comments.
+    """
+    deals = mt5.history_deals_get(start_ts, end_ts) or []
+    total = 0.0
+    wins = 0
+    trades = 0
+    per_symbol: Dict[str, float] = {s: 0.0 for s in symbols}
+
+    for d in deals:
+        try:
+            if getattr(d, "entry", None) != mt5.DEAL_ENTRY_OUT:
+                continue
+            sym = getattr(d, "symbol", "")
+            if sym not in per_symbol:
+                continue
+            magic_ok = int(getattr(d, "magic", 0) or 0) == MAGIC_NUMBER
+            comment  = (getattr(d, "comment", "") or "")
+            if not (magic_ok or "python_entry" in comment or "close_by_python" in comment):
+                continue
+
+            # MT5 fields: profit, commission, swap (commission/swap can be 0 or negative)
+            p  = float(getattr(d, "profit", 0.0) or 0.0)
+            c  = float(getattr(d, "commission", 0.0) or 0.0)
+            sw = float(getattr(d, "swap", 0.0) or 0.0)
+            net = p + c + sw
+
+            total += net
+            per_symbol[sym] += net
+            trades += 1
+            if net > 0:
+                wins += 1
+        except Exception:
+            continue
+
+    winrate = (wins / trades * 100.0) if trades else 0.0
+    return {"total": total, "trades": trades, "wins": wins, "winrate": winrate, "per_symbol": per_symbol}
+
+def format_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, sym_summary: dict) -> str:
+    lines = []
+    lines.append("<b>📊 Daily Summary</b>")
+    lines.append(f"<b>Period:</b> {start_ts:%Y-%m-%d %H:%M} → {end_ts:%Y-%m-%d %H:%M} UTC")
+    lines.append(f"<b>Trades:</b> {sym_summary['trades']}   <b>Win rate:</b> {sym_summary['winrate']:.0f}%")
+    lines.append(f"<b>Net P/L:</b> {human_pl(sym_summary['total'])}")
+    lines.append("<b>By symbol:</b>")
+    for s, v in sym_summary["per_symbol"].items():
+        lines.append(f"• {s}: {human_pl(v)}")
+    return "\n".join(lines)
+
 
 def human_pl(v: float) -> str:
     sign = "🟢" if v >= 0 else "🔴"
@@ -389,6 +449,7 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config()
+    
     symbols = (args.symbols.split(",") if args.symbols else cfg.get("symbols", []))
     tfs = cfg.get("timeframes", ["M5"])
     assert all(tf in TF_MAP for tf in tfs), f"Unsupported TF in config; allowed {list(TF_MAP)}"
@@ -414,7 +475,23 @@ def main():
     trades_today: Dict[str, int] = {s: 0 for s in symbols}
     last_open_time: Dict[str, dt.datetime]  = {s: dt.datetime.min.replace(tzinfo=dt.timezone.utc) for s in symbols}
     last_close_time: Dict[str, dt.datetime] = {s: dt.datetime.min.replace(tzinfo=dt.timezone.utc) for s in symbols}
-
+    
+    # --- Sync with any live positions in MT5 ---
+    positions = mt5.positions_get()
+    if positions:
+        for p in positions:
+            if p.symbol not in symbols:
+                continue
+            side = +1 if p.type == mt5.POSITION_TYPE_BUY else -1
+            open_side[p.symbol] = side
+            # use position open_time from MT5
+            if getattr(p, "time", None):
+                t_open = dt.datetime.fromtimestamp(p.time, tz=dt.timezone.utc)
+                last_open_time[p.symbol] = t_open
+            logger.info(
+                f"{p.symbol}: detected {'LONG' if side>0 else 'SHORT'} {p.volume} lots "
+                f"@ {p.prSice_open:.5f} (since {last_open_time[p.symbol]})")
+        
     day_start = today_utc_start()
     equity_day_open = account_equity()
     paused_for_dd = False
@@ -422,8 +499,16 @@ def main():
     logger.info("🟢 Bot started (M5 FX, low-equity safe).")
 
     while True:
-        # New day reset
+        # New day: first send summary for the day that just ended, then reset
         if now_utc() >= day_start + dt.timedelta(days=1):
+            try:
+                end_ts = now_utc()
+                summary = build_daily_summary(day_start, end_ts, symbols)
+                msg = format_daily_summary(day_start, end_ts, summary)
+                send_telegram_alert(cfg, msg)
+            except Exception as e:
+                logger.exception(f"Daily summary failed: {e}")
+
             day_start = today_utc_start()
             equity_day_open = account_equity()
             trades_today = {s: 0 for s in symbols}
