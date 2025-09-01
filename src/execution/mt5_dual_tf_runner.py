@@ -101,74 +101,81 @@ def symbol_info_or_raise(symbol: str):
         mt5.symbol_select(symbol, True)
     return info
 
-def close_symbol_positions(symbol: str):
+def close_positions_with_summary(symbol: str):
+    """
+    Close all positions for 'symbol' and return summary:
+    {'total_profit': float, 'legs': [...], 'balance': float}
+
+    Robust matching:
+      - wait until positions are actually gone
+      - search wider time window
+      - match by position_id, symbol, and our magic/comment
+    """
+    # Snapshot BEFORE close (for tickets/entry price/side/vol)
     positions = mt5.positions_get(symbol=symbol)
-    if positions is None:
-        logger.error(f"positions_get({symbol}) failed: {mt5.last_error()}")
-        return {"ok": False, "msg": str(mt5.last_error())}
-    if len(positions) == 0:
-        return {"ok": True, "msg": "no positions"}
-    tick = mt5.symbol_info_tick(symbol)
-    results = []
-    for pos in positions:
-        lot = pos.volume
-        deal_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
-        price = tick.bid if deal_type == mt5.ORDER_TYPE_SELL else tick.ask
-        req = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": lot,
-            "type": deal_type,
-            "position": pos.ticket,
-            "price": price,
-            "deviation": 20,
-            "magic": 202501,
-            "comment": "close_by_python",
-            "type_filling": mt5.ORDER_FILLING_FOK,
-        }
-        r = mt5.order_send(req)
-        results.append(f"{pos.ticket}:{r.retcode}")
-    return {"ok": True, "msg": ";".join(results)}
+    if positions is None or len(positions) == 0:
+        return {"total_profit": 0.0, "legs": [], "balance": account_equity()}
 
-def calc_sl_tp(side: int, price: float, atr_val: float, sl_mult: float, tp_mult: float) -> Tuple[float, float]:
-    if side > 0:
-        return float(price - sl_mult * atr_val), float(price + tp_mult * atr_val)
-    else:
-        return float(price + sl_mult * atr_val), float(price - tp_mult * atr_val)
+    before_ts = now_utc()  # timestamp just before sending closes
 
-def place_market_order(symbol: str, side: int, lots: float, sl: float | None=None, tp: float | None=None) -> dict:
-    info = symbol_info_or_raise(symbol)
-    tick = mt5.symbol_info_tick(symbol)
-    order_type = mt5.ORDER_TYPE_BUY if side > 0 else mt5.ORDER_TYPE_SELL
-    price = tick.ask if side > 0 else tick.bid
+    legs = []
+    ticket_set = set()
+    for p in positions:
+        legs.append({
+            "ticket": int(p.ticket),
+            "symbol": p.symbol,
+            "side": "LONG" if p.type == mt5.POSITION_TYPE_BUY else "SHORT",
+            "volume": float(p.volume),
+            "price_open": float(p.price_open),
+        })
+        ticket_set.add(int(p.ticket))
 
-    # snap SL/TP to symbol point grid
-    if sl is not None or tp is not None:
-        point = float(getattr(info, "point", 0.0) or 0.0)
-        if point > 0:
-            if sl is not None: sl = round(sl / point) * point
-            if tp is not None: tp = round(tp / point) * point
+    # Request close-by-market
+    close_symbol_positions(symbol)
 
-    req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": float(lots),
-        "type": order_type,
-        "price": price,
-        "deviation": 20,
-        "magic": 202501,
-        "comment": "python_entry",
-        "type_filling": mt5.ORDER_FILLING_FOK,
-    }
-    if sl is not None: req["sl"] = sl
-    if tp is not None: req["tp"] = tp
+    # Wait until MT5 confirms there are no open positions for this symbol
+    for _ in range(40):  # up to ~10s
+        time.sleep(0.25)
+        still = mt5.positions_get(symbol=symbol) or []
+        if len(still) == 0:
+            break
 
-    if DRY_RUN:
-        return {"ok": True, "retcode": "DRY", "comment": "simulated"}
+    # Pull deals in a generous window (last 6 hours) from just before we closed
+    # Some brokers record slightly earlier/later; include both sides of 'before_ts'
+    start = before_ts - dt.timedelta(hours=6)
+    end   = now_utc() + dt.timedelta(seconds=2)
+    deals = mt5.history_deals_get(start, end) or []
 
-    result = mt5.order_send(req)
-    return {"ok": result.retcode == mt5.TRADE_RETCODE_DONE,
-            "retcode": result.retcode, "comment": result.comment}
+    total_profit = 0.0
+    exit_prices: Dict[int, float] = {}
+
+    for d in deals:
+        try:
+            # Strongest match: exact position_id we just closed
+            pid = int(getattr(d, "position_id", 0) or 0)
+            if pid in ticket_set and getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT:
+                total_profit += float(getattr(d, "profit", 0.0) or 0.0)
+                exit_prices[pid] = float(getattr(d, "price", 0.0) or 0.0)
+                continue
+
+            # Fallback match: same symbol + exit + our magic/comment
+            if getattr(d, "symbol", "") == symbol and getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT:
+                magic_ok = (int(getattr(d, "magic", 0) or 0) == 202501)
+                comment  = (getattr(d, "comment", "") or "")
+                if magic_ok or "close_by_python" in comment or "python_entry" in comment:
+                    total_profit += float(getattr(d, "profit", 0.0) or 0.0)
+                    # We cannot map to a specific ticket here reliably; just aggregate P/L
+        except Exception:
+            # Be tolerant to odd fields
+            continue
+
+    # Fill exit prices when known
+    for leg in legs:
+        leg["price_close"] = exit_prices.get(int(leg["ticket"]), None)
+
+    balance = account_equity()
+    return {"total_profit": total_profit, "legs": legs, "balance": balance}
+
 
 
 # ---------- Telegram alerts ----------
