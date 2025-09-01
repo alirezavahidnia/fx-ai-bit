@@ -484,14 +484,24 @@ def main():
                 continue
             side = +1 if p.type == mt5.POSITION_TYPE_BUY else -1
             open_side[p.symbol] = side
-            # use position open_time from MT5
+
+            # use MT5 open timestamp if available
+            t_open = None
             if getattr(p, "time", None):
-                t_open = dt.datetime.fromtimestamp(p.time, tz=dt.timezone.utc)
+                try:
+                    t_open = dt.datetime.fromtimestamp(int(p.time), tz=dt.timezone.utc)
+                except Exception:
+                    t_open = None
+            if t_open:
                 last_open_time[p.symbol] = t_open
+
+            # log a clean line
+            po = float(getattr(p, "price_open", 0.0) or 0.0)
             logger.info(
                 f"{p.symbol}: detected {'LONG' if side>0 else 'SHORT'} {p.volume} lots "
-                f"@ {p.prSice_open:.5f} (since {last_open_time[p.symbol]})")
-        
+                f"@ {po:.5f} (since {last_open_time[p.symbol]})"
+            )
+
     day_start = today_utc_start()
     equity_day_open = account_equity()
     paused_for_dd = False
