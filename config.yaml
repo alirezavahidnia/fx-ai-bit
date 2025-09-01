@@ -1,0 +1,29 @@
+broker:
+  name: MT5
+
+symbols: ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCHF"]   # keep it to 4–6 tight pairs
+
+timeframes: ["M5"]        # M5 only
+
+risk:
+  max_risk_per_trade_bps: 100         # 1% per trade target (≈ $2.77 on $276.76)
+  stop_atr_mult: 1.8                   # slightly tighter stops for M5
+  takeprofit_atr_mult: 2.6
+  kill_switch:
+    max_intraday_drawdown_pct: 2.0     # pause day if ≈ −$5.5
+    max_daily_trades_per_symbol: 6     # don’t overtrade
+
+trading_window:
+  enabled: true
+  start_hour_utc: 6                    # London open-ish
+  end_hour_utc: 20                     # London/NY overlap
+
+
+
+alerts:
+  telegram_enabled: true
+  telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
+  telegram_chat_id_env: "TELEGRAM_CHAT_ID"
+
+costs:
+  spread_bps_default: 1.2

@@ -1,0 +1,10 @@
+pandas>=2.0
+numpy>=1.24
+loguru>=0.7
+MetaTrader5>=5.0.45
+requests>=2.31
+
+# Optional for AI sentiment (enable later if you want):
+transformers>=4.40
+torch>=2.1
+PyYAML>=6.0
