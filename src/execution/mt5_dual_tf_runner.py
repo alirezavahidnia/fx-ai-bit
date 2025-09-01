@@ -1,8 +1,9 @@
 # src/execution/mt5_dual_tf_runner.py
 # MT5 runner for low-equity FX on M5.
 # - Direct MetaTrader5 API (no EA bridge)
+# - Probabilistic signal from RSI/MACD/RV with hysteresis (enter/exit)
+# - ATR-based SL/TP
 # - Risk-based lot sizing + skip if min-lot exceeds budget
-# - Hysteresis (enter/exit), min-hold, cooldown
 # - Close/flip Telegram alerts (Trade info, P/L, Balance)
 # - Daily drawdown kill-switch + daily trade cap
 # - Trading window (UTC)
@@ -18,8 +19,9 @@ from dotenv import load_dotenv
 from loguru import logger
 import MetaTrader5 as mt5
 
-# Load env containing TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
-load_dotenv("telegram_chat_id_env.env")
+# Load env (.env at repo root) for TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+# If you keep a custom env filename, pass it to load_dotenv("yourfile.env")
+load_dotenv()
 
 from ..utils.config import load_config
 from ..features.technical import rsi, macd, realized_vol, atr
@@ -34,6 +36,7 @@ COOLDOWN_MIN   = 10             # wait 10m after close before re-entering
 REQUIRE_CONSENSUS = False       # single timeframe by default; keep False
 SKIP_IF_MINLOTS_EXCEEDS_RISK = True
 RISK_TOLERANCE_MULTIPLIER = 1.0 # 1.0 strict; 1.2 = allow 20% over budget
+MAGIC_NUMBER   = 202501         # to tag our deals/orders
 
 
 # ================= Time helpers =================
@@ -101,6 +104,119 @@ def symbol_info_or_raise(symbol: str):
         mt5.symbol_select(symbol, True)
     return info
 
+def close_symbol_positions(symbol: str):
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None:
+        logger.error(f"positions_get({symbol}) failed: {mt5.last_error()}")
+        return {"ok": False, "msg": str(mt5.last_error())}
+    if len(positions) == 0:
+        return {"ok": True, "msg": "no positions"}
+    tick = mt5.symbol_info_tick(symbol)
+    results = []
+    for pos in positions:
+        lot = pos.volume
+        deal_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
+        price = tick.bid if deal_type == mt5.ORDER_TYPE_SELL else tick.ask
+        req = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": deal_type,
+            "position": pos.ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": MAGIC_NUMBER,
+            "comment": "close_by_python",
+            "type_filling": mt5.ORDER_FILLING_FOK,
+        }
+        r = mt5.order_send(req)
+        results.append(f"{pos.ticket}:{r.retcode}")
+    return {"ok": True, "msg": ";".join(results)}
+
+# ---- SL/TP helper (ATR-based) ----
+def calc_sl_tp(side: int, price: float, atr_val: float, sl_mult: float, tp_mult: float) -> Tuple[float, float]:
+    """
+    Returns (SL, TP) based on ATR:
+      - LONG:  SL = price - sl_mult*ATR, TP = price + tp_mult*ATR
+      - SHORT: SL = price + sl_mult*ATR, TP = price - tp_mult*ATR
+    """
+    atr_val = float(atr_val or 0.0)
+    if atr_val <= 0:
+        # very defensive fallback
+        point = 0.0001
+        if side > 0:
+            return price - point, price + point
+        else:
+            return price + point, price - point
+    if side > 0:
+        return float(price - sl_mult * atr_val), float(price + tp_mult * atr_val)
+    else:
+        return float(price + sl_mult * atr_val), float(price - tp_mult * atr_val)
+
+def place_market_order(symbol: str, side: int, lots: float, sl: float | None=None, tp: float | None=None) -> dict:
+    info = symbol_info_or_raise(symbol)
+    tick = mt5.symbol_info_tick(symbol)
+    order_type = mt5.ORDER_TYPE_BUY if side > 0 else mt5.ORDER_TYPE_SELL
+    price = tick.ask if side > 0 else tick.bid
+
+    # snap SL/TP to symbol point grid
+    if sl is not None or tp is not None:
+        point = float(getattr(info, "point", 0.0) or 0.0)
+        if point > 0:
+            if sl is not None: sl = round(sl / point) * point
+            if tp is not None: tp = round(tp / point) * point
+
+    req = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": float(lots),
+        "type": order_type,
+        "price": price,
+        "deviation": 20,
+        "magic": MAGIC_NUMBER,
+        "comment": "python_entry",
+        "type_filling": mt5.ORDER_FILLING_FOK,
+    }
+    if sl is not None: req["sl"] = sl
+    if tp is not None: req["tp"] = tp
+
+    if DRY_RUN:
+        return {"ok": True, "retcode": "DRY", "comment": "simulated"}
+
+    result = mt5.order_send(req)
+    return {"ok": result.retcode == mt5.TRADE_RETCODE_DONE,
+            "retcode": result.retcode, "comment": result.comment}
+
+
+# ---------- Telegram alerts ----------
+def _tg_creds(cfg):
+    a = cfg.get("alerts", {}) or {}
+    if not a.get("telegram_enabled", False):
+        return None, None
+    token = os.getenv(a.get("telegram_bot_token_env", ""))
+    chat_id = os.getenv(a.get("telegram_chat_id_env", ""))
+    if not token or not chat_id:
+        return None, None
+    return token, chat_id
+
+def send_telegram_alert(cfg: dict, text: str) -> bool:
+    token, chat_id = _tg_creds(cfg)
+    if not token or not chat_id:
+        return False
+    try:
+        r = requests.get(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            params={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
+            timeout=10,
+        )
+        return r.ok
+    except Exception:
+        return False
+
+def human_pl(v: float) -> str:
+    sign = "🟢" if v >= 0 else "🔴"
+    return f"{sign} ${abs(v):.2f}"
+
 def close_positions_with_summary(symbol: str):
     """
     Close all positions for 'symbol' and return summary:
@@ -141,7 +257,6 @@ def close_positions_with_summary(symbol: str):
             break
 
     # Pull deals in a generous window (last 6 hours) from just before we closed
-    # Some brokers record slightly earlier/later; include both sides of 'before_ts'
     start = before_ts - dt.timedelta(hours=6)
     end   = now_utc() + dt.timedelta(seconds=2)
     deals = mt5.history_deals_get(start, end) or []
@@ -151,8 +266,8 @@ def close_positions_with_summary(symbol: str):
 
     for d in deals:
         try:
-            # Strongest match: exact position_id we just closed
             pid = int(getattr(d, "position_id", 0) or 0)
+            # Primary match: deal exiting one of our tickets
             if pid in ticket_set and getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT:
                 total_profit += float(getattr(d, "profit", 0.0) or 0.0)
                 exit_prices[pid] = float(getattr(d, "price", 0.0) or 0.0)
@@ -160,92 +275,16 @@ def close_positions_with_summary(symbol: str):
 
             # Fallback match: same symbol + exit + our magic/comment
             if getattr(d, "symbol", "") == symbol and getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT:
-                magic_ok = (int(getattr(d, "magic", 0) or 0) == 202501)
+                magic_ok = (int(getattr(d, "magic", 0) or 0) == MAGIC_NUMBER)
                 comment  = (getattr(d, "comment", "") or "")
                 if magic_ok or "close_by_python" in comment or "python_entry" in comment:
                     total_profit += float(getattr(d, "profit", 0.0) or 0.0)
-                    # We cannot map to a specific ticket here reliably; just aggregate P/L
         except Exception:
-            # Be tolerant to odd fields
             continue
 
     # Fill exit prices when known
     for leg in legs:
         leg["price_close"] = exit_prices.get(int(leg["ticket"]), None)
-
-    balance = account_equity()
-    return {"total_profit": total_profit, "legs": legs, "balance": balance}
-
-
-
-# ---------- Telegram alerts ----------
-def _tg_creds(cfg):
-    a = cfg.get("alerts", {}) or {}
-    if not a.get("telegram_enabled", False):
-        return None, None
-    token = os.getenv(a.get("telegram_bot_token_env", ""))
-    chat_id = os.getenv(a.get("telegram_chat_id_env", ""))
-    if not token or not chat_id:
-        return None, None
-    return token, chat_id
-
-def send_telegram_alert(cfg: dict, text: str) -> bool:
-    token, chat_id = _tg_creds(cfg)
-    if not token or not chat_id:
-        return False
-    try:
-        r = requests.get(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            params={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
-            timeout=10,
-        )
-        return r.ok
-    except Exception:
-        return False
-
-def human_pl(v: float) -> str:
-    sign = "🟢" if v >= 0 else "🔴"
-    return f"{sign} ${abs(v):.2f}"
-
-def close_positions_with_summary(symbol: str):
-    """
-    Close all positions for 'symbol' and return summary:
-    {'total_profit': float, 'legs': [...], 'balance': float}
-    """
-    positions = mt5.positions_get(symbol=symbol)
-    if positions is None or len(positions) == 0:
-        return {"total_profit": 0.0, "legs": [], "balance": account_equity()}
-
-    legs = []
-    for p in positions:
-        legs.append({
-            "ticket": p.ticket,
-            "symbol": p.symbol,
-            "side": "LONG" if p.type == mt5.POSITION_TYPE_BUY else "SHORT",
-            "volume": float(p.volume),
-            "price_open": float(p.price_open),
-        })
-
-    # Close by market
-    close_symbol_positions(symbol)
-
-    # Let MT5 register deals
-    time.sleep(1.0)
-
-    # Accumulate realized P/L for those tickets
-    now = now_utc()
-    deals = mt5.history_deals_get(now - dt.timedelta(hours=1), now) or []
-    ticket_set = {leg["ticket"] for leg in legs}
-    total_profit = 0.0
-    exit_prices = {}
-
-    for d in deals:
-        if getattr(d, "position_id", None) in ticket_set and getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT:
-            total_profit += float(getattr(d, "profit", 0.0))
-            exit_prices[int(d.position_id)] = float(getattr(d, "price", 0.0))
-
-    for leg in legs:
-        leg["price_close"] = exit_prices.get(leg["ticket"], None)
 
     balance = account_equity()
     return {"total_profit": total_profit, "legs": legs, "balance": balance}
@@ -452,7 +491,6 @@ def main():
                     raw_side = 0
                     size_factor = 0.0
             else:
-                # single TF or permissive multi-TF
                 if any(x != 0 for x in sides):
                     raw_side = [x for x in sides if x != 0][0]
                     size_factor = 1.0
