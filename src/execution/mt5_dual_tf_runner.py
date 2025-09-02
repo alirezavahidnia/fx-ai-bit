@@ -242,70 +242,126 @@ def format_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, sym_summary
     return "\n".join(lines)
 
 # ---------- Robust close + P/L (Patch A) ----------
-def close_positions_with_summary(symbol: str, open_time_hint: Optional[dt.datetime] = None):
+# --- add this helper anywhere above close_positions_with_summary ---
+def calc_position_pl(symbol: str, side: str, vol: float,
+                     price_open: float, price_close: float) -> float:
     """
-    Close all positions for 'symbol' and return summary even if already closed.
-    {'total_profit': float, 'legs': [...], 'balance': float}
+    Compute approximate P/L in account currency using tick_size/tick_value.
+    side: "LONG" or "SHORT"
     """
+    info = symbol_info_or_raise(symbol)
+    tick_size = (getattr(info, "trade_tick_size", None) or
+                 getattr(info, "tick_size", None) or
+                 getattr(info, "point", 0.0))
+    tick_value = (getattr(info, "trade_tick_value", None) or
+                  getattr(info, "tick_value", None) or
+                  (getattr(info, "point", 0.0) * getattr(info, "trade_contract_size", 0.0)))
+    if not tick_size or not tick_value:
+        return 0.0
+    diff = (price_close - price_open)
+    if side == "SHORT":
+        diff = -diff
+    # how many ticks moved * tick value * lots
+    ticks = diff / float(tick_size)
+    return float(ticks) * float(tick_value) * float(vol)
+
+# --- replace your close_positions_with_summary with this version ---
+def close_positions_with_summary(symbol: str):
+    """
+    Close all positions for 'symbol' and return summary:
+      {'total_profit': float, 'legs': [...], 'balance': float}
+    Robustness:
+      - wait until positions are actually gone
+      - look back a wide time window
+      - match by position_id first
+      - if deals not found, compute synthetic P/L from prices/tick_value
+    """
+    positions = mt5.positions_get(symbol=symbol)
+    if positions is None or len(positions) == 0:
+        return {"total_profit": 0.0, "legs": [], "balance": account_equity()}
+
+    before_ts = now_utc()
     legs = []
     ticket_set = set()
+    for p in positions:
+        legs.append({
+            "ticket": int(p.ticket),
+            "symbol": p.symbol,
+            "side": "LONG" if p.type == mt5.POSITION_TYPE_BUY else "SHORT",
+            "volume": float(p.volume),
+            "price_open": float(p.price_open),
+        })
+        ticket_set.add(int(p.ticket))
 
-    # Current positions snapshot (if any)
-    positions = mt5.positions_get(symbol=symbol)
-    if positions:
-        for p in positions:
-            legs.append({
-                "ticket": int(p.ticket),
-                "symbol": p.symbol,
-                "side": "LONG" if p.type == mt5.POSITION_TYPE_BUY else "SHORT",
-                "volume": float(p.volume),
-                "price_open": float(p.price_open),
-            })
-            ticket_set.add(int(p.ticket))
+    # record the price we try to close at (in case broker doesn't echo exit deals)
+    last_tick = mt5.symbol_info_tick(symbol)
+    guessed_close_price = (last_tick.bid + last_tick.ask) / 2.0 if last_tick else None
 
-        # Try to close them now
-        close_symbol_positions(symbol)
+    # Request close-by-market
+    close_symbol_positions(symbol)
 
-        # Wait until MT5 confirms none left
-        for _ in range(40):  # ~10s
-            time.sleep(0.25)
-            if not (mt5.positions_get(symbol=symbol) or []):
-                break
+    # Wait up to ~10s for MT5 to flatten
+    for _ in range(40):
+        time.sleep(0.25)
+        if not (mt5.positions_get(symbol=symbol) or []):
+            break
 
-    # Always compute P/L from recent history
-    end   = now_utc() + dt.timedelta(seconds=2)
-    start = (open_time_hint or (end - dt.timedelta(hours=8)))
+    # Pull deals in a generous window
+    start = before_ts - dt.timedelta(hours=24)
+    end   = now_utc() + dt.timedelta(seconds=3)
     deals = mt5.history_deals_get(start, end) or []
 
     total_profit = 0.0
     exit_prices: Dict[int, float] = {}
+    found_any = False
 
+    # 1) Primary: match exit deals by position_id
     for d in deals:
         try:
-            if getattr(d, "symbol", "") != symbol:              # wrong symbol
+            if getattr(d, "entry", None) != mt5.DEAL_ENTRY_OUT:
                 continue
-            if getattr(d, "entry", None) != mt5.DEAL_ENTRY_OUT: # not an exit
-                continue
-            magic_ok = int(getattr(d, "magic", 0) or 0) == MAGIC_NUMBER
-            comment  = (getattr(d, "comment", "") or "")
-            if not (magic_ok or "python_entry" in comment or "close_by_python" in comment):
-                continue
-
             pid = int(getattr(d, "position_id", 0) or 0)
-            total_profit += float(getattr(d, "profit", 0.0) or 0.0) \
-                            + float(getattr(d, "commission", 0.0) or 0.0) \
-                            + float(getattr(d, "swap", 0.0) or 0.0)
-            if pid:
+            if pid in ticket_set:
+                # include profit + commission + swap
+                p  = float(getattr(d, "profit", 0.0) or 0.0)
+                c  = float(getattr(d, "commission", 0.0) or 0.0)
+                sw = float(getattr(d, "swap", 0.0) or 0.0)
+                total_profit += (p + c + sw)
                 exit_prices[pid] = float(getattr(d, "price", 0.0) or 0.0)
+                found_any = True
         except Exception:
             continue
 
-    # Fill exit prices if we had legs
-    for leg in legs:
-        leg["price_close"] = exit_prices.get(int(leg["ticket"]), None)
+    # 2) If we didn’t find deals, compute synthetic P/L per leg
+    if not found_any:
+        for leg in legs:
+            price_close = exit_prices.get(leg["ticket"])
+            if not price_close:
+                # try to find any last exit deal by symbol as a fallback
+                sym_deals = [d for d in deals
+                             if getattr(d, "symbol", "") == symbol and
+                                getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT]
+                if sym_deals:
+                    price_close = float(getattr(sym_deals[-1], "price", 0.0) or 0.0)
+            if not price_close:
+                price_close = guessed_close_price or leg["price_open"]  # worst-case: flat P/L
+
+            leg["price_close"] = float(price_close)
+            total_profit += calc_position_pl(
+                symbol=leg["symbol"],
+                side=leg["side"],
+                vol=leg["volume"],
+                price_open=leg["price_open"],
+                price_close=leg["price_close"],
+            )
+    else:
+        # we had proper exit deals; attach prices when known
+        for leg in legs:
+            if leg["ticket"] in exit_prices:
+                leg["price_close"] = exit_prices[leg["ticket"]]
 
     balance = account_equity()
-    return {"total_profit": total_profit, "legs": legs, "balance": balance}
+    return {"total_profit": float(total_profit), "legs": legs, "balance": float(balance)}
 
 def format_close_message(symbol: str, summary: dict, held_min: float, reason: str) -> str:
     lines = []
