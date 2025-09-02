@@ -26,7 +26,7 @@ MIN_HOLD_MIN   = 15
 COOLDOWN_MIN   = 10
 REQUIRE_CONSENSUS = False
 SKIP_IF_MINLOTS_EXCEEDS_RISK = True
-RISK_TOLERANCE_MULTIPLIER = 1.0
+RISK_TOLERANCE_MULTIPLIER = 1.15 # allow ~15% over budget for min lots
 MAGIC_NUMBER   = 202501
 
 # ================= Time helpers =================
