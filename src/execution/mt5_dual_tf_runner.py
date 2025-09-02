@@ -1,5 +1,11 @@
-# src/execution/mt5_dual_tf_runner.py
-# MT5 runner for low-equity FX on M5 with Telegram alerts and safety rails.
+# MT5 runner for low-equity FX on M5.
+# - Direct MetaTrader5 API (no EA bridge)
+# - Probabilistic signal from RSI/MACD/RV with hysteresis (enter/exit)
+# - ATR-based SL/TP, anchored to LIVE TICK price for correct RR
+# - Risk-based lot sizing + skip if min-lot exceeds risk budget
+# - Daily drawdown kill-switch + daily trade cap
+# - Trading window (UTC)
+# - Telegram: DAILY SUMMARY ONLY (no per-trade alerts)
 
 from __future__ import annotations
 import os, time, argparse, datetime as dt
@@ -12,22 +18,22 @@ from dotenv import load_dotenv
 from loguru import logger
 import MetaTrader5 as mt5
 
-# Load .env for TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+# Load env for TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
 load_dotenv()
 
 from ..utils.config import load_config
 from ..features.technical import rsi, macd, realized_vol, atr
 
-# ================= Tunables =================
-DRY_RUN        = False
-ENTER_THRESH   = 0.65
-EXIT_THRESH    = 0.55
-MIN_HOLD_MIN   = 15
-COOLDOWN_MIN   = 10
-REQUIRE_CONSENSUS = False
+# ================= Tunables for M5 FX =================
+DRY_RUN        = False          # True = simulate; False = send orders
+ENTER_THRESH   = 0.62           # stronger to enter on noisy M5
+EXIT_THRESH    = 0.55           # softer to exit
+MIN_HOLD_MIN   = 15             # M5: hold at least 15m
+COOLDOWN_MIN   = 10             # wait 10m after close before re-entering
+REQUIRE_CONSENSUS = False       # single timeframe by default
 SKIP_IF_MINLOTS_EXCEEDS_RISK = True
-RISK_TOLERANCE_MULTIPLIER = 1.15 # allow ~15% over budget for min lots
-MAGIC_NUMBER   = 202501
+RISK_TOLERANCE_MULTIPLIER = 1.10  # allow slight over-budget to avoid near-miss skips
+MAGIC_NUMBER   = 202501         # to tag our deals/orders
 
 # ================= Time helpers =================
 def now_utc() -> dt.datetime:
@@ -120,28 +126,56 @@ def close_symbol_positions(symbol: str):
         results.append(f"{pos.ticket}:{r.retcode}")
     return {"ok": True, "msg": ";".join(results)}
 
+# ---- SL/TP helper (ATR-based) ----
 def calc_sl_tp(side: int, price: float, atr_val: float, sl_mult: float, tp_mult: float) -> Tuple[float, float]:
+    """
+    Returns (SL, TP) based on ATR, anchored to 'price' (entry tick):
+      - LONG:  SL = price - sl_mult*ATR, TP = price + tp_mult*ATR
+      - SHORT: SL = price + sl_mult*ATR, TP = price - tp_mult*ATR
+    """
     atr_val = float(atr_val or 0.0)
     if atr_val <= 0:
         point = 0.0001
-        return (price - point, price + point) if side > 0 else (price + point, price - point)
-    return (
-        float(price - sl_mult * atr_val), float(price + tp_mult * atr_val)
-    ) if side > 0 else (
-        float(price + sl_mult * atr_val), float(price - tp_mult * atr_val)
-    )
+        if side > 0:
+            return price - point, price + point
+        else:
+            return price + point, price - point
+    if side > 0:
+        return float(price - sl_mult * atr_val), float(price + tp_mult * atr_val)
+    else:
+        return float(price + sl_mult * atr_val), float(price - tp_mult * atr_val)
 
-def place_market_order(symbol: str, side: int, lots: float, sl: Optional[float]=None, tp: Optional[float]=None) -> dict:
+def enforce_min_distance(symbol: str, side: int, entry: float, sl: float, tp: float) -> Tuple[float, float]:
+    info = symbol_info_or_raise(symbol)
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    stops_level = float(getattr(info, "stops_level", 0) or 0) * point
+    freeze_level = float(getattr(info, "freeze_level", 0) or 0) * point
+    min_dist = max(stops_level, freeze_level, 0.0)
+    if min_dist <= 0 or point <= 0:
+        return sl, tp
+    if side > 0:
+        sl = min(sl, entry - min_dist)
+        tp = max(tp, entry + min_dist)
+    else:
+        sl = max(sl, entry + min_dist)
+        tp = min(tp, entry - min_dist)
+    # snap to grid
+    if point > 0:
+        sl = round(sl / point) * point
+        tp = round(tp / point) * point
+    return sl, tp
+
+def place_market_order(symbol: str, side: int, lots: float, sl: float | None=None, tp: float | None=None) -> dict:
     info = symbol_info_or_raise(symbol)
     tick = mt5.symbol_info_tick(symbol)
     order_type = mt5.ORDER_TYPE_BUY if side > 0 else mt5.ORDER_TYPE_SELL
     price = tick.ask if side > 0 else tick.bid
 
-    if sl is not None or tp is not None:
-        point = float(getattr(info, "point", 0.0) or 0.0)
-        if point > 0:
-            if sl is not None: sl = round(sl / point) * point
-            if tp is not None: tp = round(tp / point) * point
+    # snap SL/TP to symbol grid if present
+    point = float(getattr(info, "point", 0.0) or 0.0)
+    if point > 0:
+        if sl is not None: sl = round(sl / point) * point
+        if tp is not None: tp = round(tp / point) * point
 
     req = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -164,16 +198,14 @@ def place_market_order(symbol: str, side: int, lots: float, sl: Optional[float]=
     return {"ok": result.retcode == mt5.TRADE_RETCODE_DONE,
             "retcode": result.retcode, "comment": result.comment}
 
-# ---------- Telegram ----------
+# ---------- Telegram: DAILY SUMMARY ONLY ----------
 def _tg_creds(cfg):
     a = cfg.get("alerts", {}) or {}
     if not a.get("telegram_enabled", False):
-        logger.debug("Telegram disabled in config.")
         return None, None
     token = os.getenv(a.get("telegram_bot_token_env", ""))
     chat_id = os.getenv(a.get("telegram_chat_id_env", ""))
     if not token or not chat_id:
-        logger.warning("Telegram creds missing: token/chat_id not found in env.")
         return None, None
     return token, chat_id
 
@@ -187,13 +219,8 @@ def send_telegram_alert(cfg: dict, text: str) -> bool:
             params={"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True},
             timeout=10,
         )
-        if not r.ok:
-            logger.error(f"Telegram send failed: {r.status_code} {r.text}")
-        else:
-            logger.debug("Telegram alert sent.")
         return r.ok
-    except Exception as e:
-        logger.exception(f"Telegram send exception: {e}")
+    except Exception:
         return False
 
 def human_pl(v: float) -> str:
@@ -206,6 +233,7 @@ def build_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, symbols: lis
     wins = 0
     trades = 0
     per_symbol: Dict[str, float] = {s: 0.0 for s in symbols}
+
     for d in deals:
         try:
             if getattr(d, "entry", None) != mt5.DEAL_ENTRY_OUT:
@@ -213,10 +241,7 @@ def build_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, symbols: lis
             sym = getattr(d, "symbol", "")
             if sym not in per_symbol:
                 continue
-            magic_ok = int(getattr(d, "magic", 0) or 0) == MAGIC_NUMBER
-            comment  = (getattr(d, "comment", "") or "")
-            if not (magic_ok or "python_entry" in comment or "close_by_python" in comment):
-                continue
+            # include commission and swap
             p  = float(getattr(d, "profit", 0.0) or 0.0)
             c  = float(getattr(d, "commission", 0.0) or 0.0)
             sw = float(getattr(d, "swap", 0.0) or 0.0)
@@ -224,9 +249,11 @@ def build_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, symbols: lis
             total += net
             per_symbol[sym] += net
             trades += 1
-            if net > 0: wins += 1
+            if net > 0:
+                wins += 1
         except Exception:
             continue
+
     winrate = (wins / trades * 100.0) if trades else 0.0
     return {"total": total, "trades": trades, "wins": wins, "winrate": winrate, "per_symbol": per_symbol}
 
@@ -241,166 +268,7 @@ def format_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, sym_summary
         lines.append(f"• {s}: {human_pl(v)}")
     return "\n".join(lines)
 
-# ---------- Robust close + P/L (Patch A) ----------
-# --- add this helper anywhere above close_positions_with_summary ---
-def calc_position_pl(symbol: str, side: str, vol: float,
-                     price_open: float, price_close: float) -> float:
-    """
-    Compute approximate P/L in account currency using tick_size/tick_value.
-    side: "LONG" or "SHORT"
-    """
-    info = symbol_info_or_raise(symbol)
-    tick_size = (getattr(info, "trade_tick_size", None) or
-                 getattr(info, "tick_size", None) or
-                 getattr(info, "point", 0.0))
-    tick_value = (getattr(info, "trade_tick_value", None) or
-                  getattr(info, "tick_value", None) or
-                  (getattr(info, "point", 0.0) * getattr(info, "trade_contract_size", 0.0)))
-    if not tick_size or not tick_value:
-        return 0.0
-    diff = (price_close - price_open)
-    if side == "SHORT":
-        diff = -diff
-    # how many ticks moved * tick value * lots
-    ticks = diff / float(tick_size)
-    return float(ticks) * float(tick_value) * float(vol)
-
-# ---------------- Main close with summary ----------------
-def close_positions_with_summary(symbol: str,
-                                 open_time_hint: Optional[dt.datetime] = None):
-    """
-    Close all positions for 'symbol' and return summary:
-      {'total_profit': float, 'legs': [...], 'balance': float}
-
-    Robust matching:
-      - wait until positions are actually gone
-      - search history window guided by open_time_hint if provided
-      - match by position_id first
-      - if no deals found, compute synthetic P/L from prices/tick_value
-    """
-    positions = mt5.positions_get(symbol=symbol)
-    if positions is None or len(positions) == 0:
-        return {"total_profit": 0.0, "legs": [], "balance": account_equity()}
-
-    before_ts = now_utc()
-    legs = []
-    ticket_set = set()
-    for p in positions:
-        legs.append({
-            "ticket": int(p.ticket),
-            "symbol": p.symbol,
-            "side": "LONG" if p.type == mt5.POSITION_TYPE_BUY else "SHORT",
-            "volume": float(p.volume),
-            "price_open": float(p.price_open),
-        })
-        ticket_set.add(int(p.ticket))
-
-    # keep a guess of exit price in case broker doesn't record exit deals
-    last_tick = mt5.symbol_info_tick(symbol)
-    guessed_close_price = (last_tick.bid + last_tick.ask) / 2.0 if last_tick else None
-
-    # close by market
-    close_symbol_positions(symbol)
-
-    # wait until flattened (max ~10s)
-    for _ in range(40):
-        time.sleep(0.25)
-        if not (mt5.positions_get(symbol=symbol) or []):
-            break
-
-    # history window:
-    # if we know when we opened, start a few hours before that; else a wide default
-    if open_time_hint:
-        start = (open_time_hint - dt.timedelta(hours=8)).replace(tzinfo=dt.timezone.utc)
-    else:
-        start = before_ts - dt.timedelta(hours=24)
-    end = now_utc() + dt.timedelta(seconds=3)
-
-    deals = mt5.history_deals_get(start, end) or []
-
-    total_profit = 0.0
-    exit_prices: Dict[int, float] = {}
-    found_any = False
-
-    # 1) primary: match exit deals by position_id, include commission/swap
-    for d in deals:
-        try:
-            if getattr(d, "entry", None) != mt5.DEAL_ENTRY_OUT:
-                continue
-            pid = int(getattr(d, "position_id", 0) or 0)
-            if pid in ticket_set:
-                p  = float(getattr(d, "profit", 0.0) or 0.0)
-                c  = float(getattr(d, "commission", 0.0) or 0.0)
-                sw = float(getattr(d, "swap", 0.0) or 0.0)
-                total_profit += (p + c + sw)
-                exit_prices[pid] = float(getattr(d, "price", 0.0) or 0.0)
-                found_any = True
-        except Exception:
-            continue
-
-    # helper for synthetic P/L
-    def _calc_pl(symbol: str, side: str, vol: float,
-                 price_open: float, price_close: float) -> float:
-        info = symbol_info_or_raise(symbol)
-        tick_size = (getattr(info, "trade_tick_size", None) or
-                     getattr(info, "tick_size", None) or
-                     getattr(info, "point", 0.0))
-        tick_value = (getattr(info, "trade_tick_value", None) or
-                      getattr(info, "tick_value", None) or
-                      (getattr(info, "point", 0.0) * getattr(info, "trade_contract_size", 0.0)))
-        if not tick_size or not tick_value:
-            return 0.0
-        diff = (price_close - price_open)
-        if side == "SHORT":
-            diff = -diff
-        ticks = diff / float(tick_size)
-        return float(ticks) * float(tick_value) * float(vol)
-
-    # 2) fallback: synthetic P/L if we didn't get exit deals
-    if not found_any:
-        for leg in legs:
-            price_close = exit_prices.get(leg["ticket"])
-            if not price_close:
-                # try last exit deal by symbol
-                sym_deals = [d for d in deals
-                             if getattr(d, "symbol", "") == symbol and
-                                getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT]
-                if sym_deals:
-                    price_close = float(getattr(sym_deals[-1], "price", 0.0) or 0.0)
-            if not price_close:
-                price_close = guessed_close_price or leg["price_open"]  # worst-case: flat
-            leg["price_close"] = float(price_close)
-            total_profit += _calc_pl(
-                symbol=leg["symbol"],
-                side=leg["side"],
-                vol=leg["volume"],
-                price_open=leg["price_open"],
-                price_close=leg["price_close"],
-            )
-    else:
-        for leg in legs:
-            if leg["ticket"] in exit_prices:
-                leg["price_close"] = exit_prices[leg["ticket"]]
-
-    balance = account_equity()
-    return {"total_profit": float(total_profit), "legs": legs, "balance": float(balance)}
-
-def format_close_message(symbol: str, summary: dict, held_min: float, reason: str) -> str:
-    lines = []
-    lines.append(f"<b>✅ Trade Closed</b>")
-    lines.append(f"<b>Symbol:</b> {symbol}")
-    lines.append(f"<b>Reason:</b> {reason}")
-    lines.append(f"<b>Held:</b> {held_min:.1f} min")
-    if summary["legs"]:
-        for i, leg in enumerate(summary["legs"], 1):
-            entry = f'{leg["price_open"]:.5f}' if leg["price_open"] is not None else "?"
-            exitp = f'{leg.get("price_close", 0.0):.5f}' if leg.get("price_close") else "?"
-            lines.append(f"• {i}) {leg['side']} {leg['volume']:.2f} @ {entry} → {exitp}")
-    lines.append(f"<b>P/L:</b> {human_pl(summary['total_profit'])}")
-    lines.append(f"<b>Balance:</b> ${summary['balance']:.2f}")
-    return "\n".join(lines)
-
-# ================= Risk sizing =================
+# ================= Robust lot sizing (FX-friendly) =================
 def first_non_none(*vals):
     for v in vals:
         if v is not None:
@@ -418,7 +286,11 @@ def clamp_to_step(x: float, step: float, min_v: float, max_v: float) -> float:
     return round(steps * step, 3)
 
 def lots_for_risk(symbol: str, equity: float, stop_distance_price: float, bps: float) -> float:
+    """
+    Compute lots so loss at SL ≈ equity * (bps / 1e4), robust across MT5 builds.
+    """
     info = symbol_info_or_raise(symbol)
+
     tick_size = first_non_none(
         getattr(info, "trade_tick_size", None),
         getattr(info, "tick_size", None),
@@ -431,6 +303,7 @@ def lots_for_risk(symbol: str, equity: float, stop_distance_price: float, bps: f
         getattr(info, "trade_tick_value_loss", None),
         (getattr(info, "point", 0.0) * getattr(info, "trade_contract_size", 0.0)) or None,
     )
+
     vol_min  = float(getattr(info, "volume_min", 0.01) or 0.01)
     vol_step = float(getattr(info, "volume_step", 0.01) or 0.01)
     vol_max  = float(getattr(info, "volume_max", 100.0) or 100.0)
@@ -485,8 +358,11 @@ def main():
 
     risk_cfg = cfg["risk"]
     sl_mult  = float(risk_cfg.get("stop_atr_mult", 1.8))
-    tp_mult  = float(risk_cfg.get("takeprofit_atr_mult", 2.6))
-    trade_bps = float(risk_cfg.get("max_risk_per_trade_bps", 100.0))
+    tp_mult  = float(risk_cfg.get("takeprofit_atr_mult", 2.5))
+    if tp_mult <= sl_mult:
+        logger.warning(f"takeprofit_atr_mult ({tp_mult}) <= stop_atr_mult ({sl_mult}); consider tp_mult > sl_mult for RR>1")
+
+    trade_bps = float(risk_cfg.get("max_risk_per_trade_bps", 60.0))  # 60 bps default
 
     kill = risk_cfg["kill_switch"]
     daily_dd_max   = float(kill.get("max_intraday_drawdown_pct", 2.0))
@@ -504,7 +380,7 @@ def main():
     last_open_time: Dict[str, dt.datetime]  = {s: dt.datetime.min.replace(tzinfo=dt.timezone.utc) for s in symbols}
     last_close_time: Dict[str, dt.datetime] = {s: dt.datetime.min.replace(tzinfo=dt.timezone.utc) for s in symbols}
 
-    # --- Sync with any live positions in MT5 (on startup) ---
+    # --- Sync with any live positions in MT5 ---
     positions = mt5.positions_get()
     if positions:
         for p in positions:
@@ -512,18 +388,12 @@ def main():
                 continue
             side = +1 if p.type == mt5.POSITION_TYPE_BUY else -1
             open_side[p.symbol] = side
-            t_open = None
             if getattr(p, "time", None):
-                try:
-                    t_open = dt.datetime.fromtimestamp(int(p.time), tz=dt.timezone.utc)
-                except Exception:
-                    t_open = None
-            if t_open:
+                t_open = dt.datetime.fromtimestamp(p.time, tz=dt.timezone.utc)
                 last_open_time[p.symbol] = t_open
-            po = float(getattr(p, "price_open", 0.0) or 0.0)
             logger.info(
-                f"{p.symbol}: detected {'LONG' if side>0 else 'SHORT'} {p.volume} lots "
-                f"@ {po:.5f} (since {last_open_time[p.symbol]})"
+                f"{p.symbol}: detected {'LONG' if side>0 else 'SHORT'} {p.volume:.2f} lots "
+                f"@ {p.price_open:.5f} (since {last_open_time[p.symbol]})"
             )
 
     day_start = today_utc_start()
@@ -533,7 +403,7 @@ def main():
     logger.info("🟢 Bot started (M5 FX, low-equity safe).")
 
     while True:
-        # Daily rollover summary + reset
+        # New day: first send summary for the day that just ended, then reset
         if now_utc() >= day_start + dt.timedelta(days=1):
             try:
                 end_ts = now_utc()
@@ -570,27 +440,14 @@ def main():
             if trades_today[s] >= max_trades_day:
                 continue
 
-            # ---------- Patch B: broker/TP/SL watcher ----------
-            cur_positions = mt5.positions_get(symbol=s) or []
-            has_live = len(cur_positions) > 0
-            if open_side[s] != 0 and not has_live:
-                held_min = (now_utc() - last_open_time[s]).total_seconds() / 60.0
-                summary = close_positions_with_summary(s, open_time_hint=last_open_time[s])
-                msg = format_close_message(s, summary, held_min, reason="Broker exit (TP/SL/Manual)")
-                send_telegram_alert(cfg, msg)
-                last_close_time[s] = now_utc()
-                open_side[s] = 0
-                trades_today[s] += 1
-                continue  # move to next symbol this cycle
-
             tf_probs = {}
             tf_atr   = {}
             tf_price = {}
             updated_any = False
 
             for tf in tfs:
-                df = fetch_bars(s, tf_codes[tf], count=400)
-                if df.empty or len(df) < 120:
+                df = fetch_bars(s, tf_codes[tf], count=400)  # M5: 400 bars ~ 33h
+                if df.empty or len(df) < 120:  # warmup
                     continue
                 last = df.index[-1]
                 if last == last_bar_time[s][tf]:
@@ -620,65 +477,71 @@ def main():
                     raw_side = sides[0] if sides[0] != 0 else [x for x in sides if x != 0][0]
                     size_factor = 1.0
                 else:
-                    raw_side = 0; size_factor = 0.0
+                    raw_side = 0
+                    size_factor = 0.0
             else:
                 if any(x != 0 for x in sides):
-                    raw_side = [x for x in sides if x != 0][0]; size_factor = 1.0
+                    raw_side = [x for x in sides if x != 0][0]
+                    size_factor = 1.0
                 else:
-                    raw_side = 0; size_factor = 0.0
+                    raw_side = 0
+                    size_factor = 0.0
 
             atr_vals= [v for v in tf_atr.values() if v is not None]
-            prices  = [v for v in tf_price.values() if v is not None]
-            if not atr_vals or not prices:
+            if not atr_vals:
                 continue
-            atr_use   = atr_vals[-1]
-            price_use = prices[-1]
-            probs     = [p for p in tf_probs.values()]
-            conf      = float(np.median(probs)) if probs else 0.5
+            atr_use = atr_vals[-1]
 
             # Hysteresis / hold / cooldown
-            now = now_utc()
-            held_min = (now - last_open_time[s]).total_seconds() / 60.0
-            cool_min = (now - last_close_time[s]).total_seconds() / 60.0
+            nowt = now_utc()
+            held_min = (nowt - last_open_time[s]).total_seconds() / 60.0
+            cool_min = (nowt - last_close_time[s]).total_seconds() / 60.0
             current = open_side[s]
             desired = current
 
             if current == 0:
                 if cool_min >= COOLDOWN_MIN:
-                    if raw_side > 0 and conf >= ENTER_THRESH:  desired = +1
-                    elif raw_side < 0 and conf >= ENTER_THRESH: desired = -1
+                    if raw_side > 0 and float(np.median(list(tf_probs.values()))) >= ENTER_THRESH:
+                        desired = +1
+                    elif raw_side < 0 and float(np.median(list(tf_probs.values()))) >= ENTER_THRESH:
+                        desired = -1
             else:
+                conf = float(np.median(list(tf_probs.values()))) if tf_probs else 0.5
                 if held_min >= MIN_HOLD_MIN:
                     if conf <= EXIT_THRESH or raw_side == 0:
                         desired = 0
                     elif raw_side != current and conf >= ENTER_THRESH:
                         desired = raw_side
 
-            # Execute
+            # ---------------- Execute if change ----------------
             if desired == current:
-                pass
+                pass  # no action
 
             elif desired == 0:
-                if current != 0:
-                    if not DRY_RUN:
-                        summary = close_positions_with_summary(s, open_time_hint=last_open_time[s])
-                        msg = format_close_message(s, summary, held_min, reason="Signal exit / flat")
-                        send_telegram_alert(cfg, msg)
-                    logger.info(f"{s}: FLAT (held {held_min:.1f}m, conf={conf:.2f})")
-                last_close_time[s] = now
+                if current != 0 and not DRY_RUN:
+                    close_symbol_positions(s)
+                logger.info(f"{s}: FLAT (held {held_min:.1f}m)")
+                last_close_time[s] = nowt
                 open_side[s] = 0
                 trades_today[s] += 1
 
             else:
-                if current != 0 and desired != current:
-                    if not DRY_RUN:
-                        summary = close_positions_with_summary(s, open_time_hint=last_open_time[s])
-                        msg = format_close_message(s, summary, held_min, reason="Flip")
-                        send_telegram_alert(cfg, msg)
-                    logger.info(f"{s}: FLIP {('LONG' if current>0 else 'SHORT')}→{('LONG' if desired>0 else 'SHORT')}")
+                # If flipping, close first
+                if current != 0 and desired != current and not DRY_RUN:
+                    close_symbol_positions(s)
+                    last_close_time[s] = nowt
 
-                sl, tp = calc_sl_tp(desired, price_use, atr_use, sl_mult, tp_mult)
-                stop_dist = abs(price_use - sl)
+                # Use LIVE TICK to anchor SL/TP and risk sizing
+                tick_now = mt5.symbol_info_tick(s)
+                if not tick_now:
+                    logger.warning(f"{s}: no tick, skipping")
+                    continue
+                entry_price = tick_now.ask if desired > 0 else tick_now.bid
+
+                sl, tp = calc_sl_tp(desired, entry_price, atr_use, sl_mult, tp_mult)
+                sl, tp = enforce_min_distance(s, desired, entry_price, sl, tp)
+
+                stop_dist = abs(entry_price - sl)
                 equity = account_equity()
 
                 lots_base = lots_for_risk(s, equity, stop_dist, trade_bps)
@@ -694,13 +557,13 @@ def main():
 
                 resp = {"ok": True, "retcode": "DRY", "comment": "simulated"} if DRY_RUN \
                        else place_market_order(s, desired, lots, sl=sl, tp=tp)
-                logger.info(f"{s}: {'LONG' if desired>0 else 'SHORT'} lots={lots} conf={conf:.2f} "
+                logger.info(f"{s}: {'LONG' if desired>0 else 'SHORT'} lots={lots} "
                             f"SL={sl:.5f} TP={tp:.5f} (risk {trade_bps}bps) resp={resp}")
-                last_open_time[s] = now
+                last_open_time[s] = nowt
                 open_side[s] = desired
                 trades_today[s] += 1
 
-        time.sleep(30)  # check twice a minute
+        time.sleep(30)  # M5 cadence, ~2 checks per minute
 
 if __name__ == "__main__":
     main()
