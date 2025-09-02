@@ -6,12 +6,13 @@ symbols: ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCHF"]   # keep it to 4–6 tig
 timeframes: ["M5"]        # M5 only
 
 risk:
-  max_risk_per_trade_bps: 100         # 1% per trade target (≈ $2.77 on $276.76)
-  stop_atr_mult: 1.8                   # slightly tighter stops for M5
-  takeprofit_atr_mult: 2.6
+  max_risk_per_trade_bps: 50         # 1% per trade target (≈ $2.77 on $276.76)
+  stop_atr_mult: 2.0                   # slightly tighter stops for M5
+  takeprofit_atr_mult: 2.8
+  
   kill_switch:
-    max_intraday_drawdown_pct: 2.0     # pause day if ≈ −$5.5
-    max_daily_trades_per_symbol: 6     # don’t overtrade
+    max_intraday_drawdown_pct: 3.0     # pause day if ≈ −$5.5
+    max_daily_trades_per_symbol: 3     # don’t overtrade
 
 trading_window:
   enabled: true
