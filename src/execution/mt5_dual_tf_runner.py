@@ -265,16 +265,18 @@ def calc_position_pl(symbol: str, side: str, vol: float,
     ticks = diff / float(tick_size)
     return float(ticks) * float(tick_value) * float(vol)
 
-# --- replace your close_positions_with_summary with this version ---
-def close_positions_with_summary(symbol: str):
+# ---------------- Main close with summary ----------------
+def close_positions_with_summary(symbol: str,
+                                 open_time_hint: Optional[dt.datetime] = None):
     """
     Close all positions for 'symbol' and return summary:
       {'total_profit': float, 'legs': [...], 'balance': float}
-    Robustness:
+
+    Robust matching:
       - wait until positions are actually gone
-      - look back a wide time window
+      - search history window guided by open_time_hint if provided
       - match by position_id first
-      - if deals not found, compute synthetic P/L from prices/tick_value
+      - if no deals found, compute synthetic P/L from prices/tick_value
     """
     positions = mt5.positions_get(symbol=symbol)
     if positions is None or len(positions) == 0:
@@ -293,36 +295,40 @@ def close_positions_with_summary(symbol: str):
         })
         ticket_set.add(int(p.ticket))
 
-    # record the price we try to close at (in case broker doesn't echo exit deals)
+    # keep a guess of exit price in case broker doesn't record exit deals
     last_tick = mt5.symbol_info_tick(symbol)
     guessed_close_price = (last_tick.bid + last_tick.ask) / 2.0 if last_tick else None
 
-    # Request close-by-market
+    # close by market
     close_symbol_positions(symbol)
 
-    # Wait up to ~10s for MT5 to flatten
+    # wait until flattened (max ~10s)
     for _ in range(40):
         time.sleep(0.25)
         if not (mt5.positions_get(symbol=symbol) or []):
             break
 
-    # Pull deals in a generous window
-    start = before_ts - dt.timedelta(hours=24)
-    end   = now_utc() + dt.timedelta(seconds=3)
+    # history window:
+    # if we know when we opened, start a few hours before that; else a wide default
+    if open_time_hint:
+        start = (open_time_hint - dt.timedelta(hours=8)).replace(tzinfo=dt.timezone.utc)
+    else:
+        start = before_ts - dt.timedelta(hours=24)
+    end = now_utc() + dt.timedelta(seconds=3)
+
     deals = mt5.history_deals_get(start, end) or []
 
     total_profit = 0.0
     exit_prices: Dict[int, float] = {}
     found_any = False
 
-    # 1) Primary: match exit deals by position_id
+    # 1) primary: match exit deals by position_id, include commission/swap
     for d in deals:
         try:
             if getattr(d, "entry", None) != mt5.DEAL_ENTRY_OUT:
                 continue
             pid = int(getattr(d, "position_id", 0) or 0)
             if pid in ticket_set:
-                # include profit + commission + swap
                 p  = float(getattr(d, "profit", 0.0) or 0.0)
                 c  = float(getattr(d, "commission", 0.0) or 0.0)
                 sw = float(getattr(d, "swap", 0.0) or 0.0)
@@ -332,22 +338,39 @@ def close_positions_with_summary(symbol: str):
         except Exception:
             continue
 
-    # 2) If we didn’t find deals, compute synthetic P/L per leg
+    # helper for synthetic P/L
+    def _calc_pl(symbol: str, side: str, vol: float,
+                 price_open: float, price_close: float) -> float:
+        info = symbol_info_or_raise(symbol)
+        tick_size = (getattr(info, "trade_tick_size", None) or
+                     getattr(info, "tick_size", None) or
+                     getattr(info, "point", 0.0))
+        tick_value = (getattr(info, "trade_tick_value", None) or
+                      getattr(info, "tick_value", None) or
+                      (getattr(info, "point", 0.0) * getattr(info, "trade_contract_size", 0.0)))
+        if not tick_size or not tick_value:
+            return 0.0
+        diff = (price_close - price_open)
+        if side == "SHORT":
+            diff = -diff
+        ticks = diff / float(tick_size)
+        return float(ticks) * float(tick_value) * float(vol)
+
+    # 2) fallback: synthetic P/L if we didn't get exit deals
     if not found_any:
         for leg in legs:
             price_close = exit_prices.get(leg["ticket"])
             if not price_close:
-                # try to find any last exit deal by symbol as a fallback
+                # try last exit deal by symbol
                 sym_deals = [d for d in deals
                              if getattr(d, "symbol", "") == symbol and
                                 getattr(d, "entry", None) == mt5.DEAL_ENTRY_OUT]
                 if sym_deals:
                     price_close = float(getattr(sym_deals[-1], "price", 0.0) or 0.0)
             if not price_close:
-                price_close = guessed_close_price or leg["price_open"]  # worst-case: flat P/L
-
+                price_close = guessed_close_price or leg["price_open"]  # worst-case: flat
             leg["price_close"] = float(price_close)
-            total_profit += calc_position_pl(
+            total_profit += _calc_pl(
                 symbol=leg["symbol"],
                 side=leg["side"],
                 vol=leg["volume"],
@@ -355,7 +378,6 @@ def close_positions_with_summary(symbol: str):
                 price_close=leg["price_close"],
             )
     else:
-        # we had proper exit deals; attach prices when known
         for leg in legs:
             if leg["ticket"] in exit_prices:
                 leg["price_close"] = exit_prices[leg["ticket"]]
