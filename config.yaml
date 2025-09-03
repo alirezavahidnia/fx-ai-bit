@@ -1,18 +1,18 @@
 broker:
   name: MT5
 
-symbols: ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCHF"]   # keep it to 4–6 tight pairs
+symbols: ["EURUSD","GBPUSD","USDJPY"]   # keep it to 3 tight pairs
 
 timeframes: ["M5"]        # M5 only
 
 risk:
-  max_risk_per_trade_bps: 60           # was 50 (or 47.2 implied by $4.72 on $1000)
-  stop_atr_mult: 1.8                   # slightly tighter stops for M5
-  takeprofit_atr_mult: 2.5             # slightly lower TP for M5
-    
+  max_risk_per_trade_bps: 80           # 0.8% of equity per trade, fewer skips
+  stop_atr_mult: 2.0                   # a bit wider SL, lets trades breathe
+  takeprofit_atr_mult: 3.0             # wider TP, aiming for ~1:1.5 RR
+  
   kill_switch:
-    max_intraday_drawdown_pct: 3.0     # pause day if ≈ −$5.5
-    max_daily_trades_per_symbol: 3     # don’t overtrade
+    max_intraday_drawdown_pct: 4.0     # give bot room for volatility
+    max_daily_trades_per_symbol: 6
 
 trading_window:
   enabled: true
