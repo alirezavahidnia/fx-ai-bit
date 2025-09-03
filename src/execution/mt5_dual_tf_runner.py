@@ -351,6 +351,30 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config()
+
+    # --- NEW: override strategy knobs safely from config.yaml ---
+    def _as_float(val, default):
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return default
+
+    def _as_int(val, default):
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
+
+    strat = cfg.get("strategy", {}) or {}
+
+    # Override global defaults (must declare as global if you want to overwrite them)
+    global ENTER_THRESH, EXIT_THRESH, MIN_HOLD_MIN, COOLDOWN_MIN
+    ENTER_THRESH = _as_float(strat.get("enter_thresh"), ENTER_THRESH)
+    EXIT_THRESH  = _as_float(strat.get("exit_thresh"),  EXIT_THRESH)
+    MIN_HOLD_MIN = _as_int  (strat.get("min_hold_min"), MIN_HOLD_MIN)
+    COOLDOWN_MIN = _as_int  (strat.get("cooldown_min"), COOLDOWN_MIN)
+    # ------------------------------------------------------------
+
     symbols = (args.symbols.split(",") if args.symbols else cfg.get("symbols", []))
     tfs = cfg.get("timeframes", ["M5"])
     assert all(tf in TF_MAP for tf in tfs), f"Unsupported TF in config; allowed {list(TF_MAP)}"

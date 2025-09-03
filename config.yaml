@@ -19,6 +19,17 @@ trading_window:
   start_hour_utc: 6                    # London open-ish
   end_hour_utc: 20                     # London/NY overlap
 
+strategy:
+  # How long to keep a position before we even consider closing (minutes)
+  min_hold_min: 30
+
+  # Confidence threshold to EXIT early after min_hold_min has passed
+  # Lower = requires a stronger reversal to close (0.45 is stricter than 0.55)
+  exit_thresh: 0.45
+
+  # (Optional) If you want to tweak these via config too:
+  enter_thresh: 0.62
+  cooldown_min: 10
 
 
 alerts:
