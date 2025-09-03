@@ -1,15 +1,14 @@
 # MT5 runner for low-equity FX on M5.
-# - Direct MetaTrader5 API (no EA bridge)
-# - Probabilistic signal from RSI/MACD/RV with hysteresis (enter/exit)
-# - ATR-based SL/TP, anchored to LIVE TICK price for correct RR
-# - Risk-based lot sizing + skip if min-lot exceeds risk budget
+# - Symmetric probability (EMA50/EMA200 + MACD/RV + RSI) for balanced longs/shorts
+# - ATR-based SL/TP anchored to LIVE tick price; respects broker min distances
+# - Risk-based lot sizing + skip if min-lot exceeds risk budget (with small tolerance)
+# - Min-hold + cooldown + hysteresis; config-driven strategy thresholds
 # - Daily drawdown kill-switch + daily trade cap
-# - Trading window (UTC)
 # - Telegram: DAILY SUMMARY ONLY (no per-trade alerts)
 
 from __future__ import annotations
 import os, time, argparse, datetime as dt
-from typing import Dict, Tuple, Optional
+from typing import Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -24,16 +23,16 @@ load_dotenv()
 from ..utils.config import load_config
 from ..features.technical import rsi, macd, realized_vol, atr
 
-# ================= Tunables for M5 FX =================
-DRY_RUN        = False          # True = simulate; False = send orders
-ENTER_THRESH   = 0.62           # stronger to enter on noisy M5
-EXIT_THRESH    = 0.55           # softer to exit
-MIN_HOLD_MIN   = 15             # M5: hold at least 15m
-COOLDOWN_MIN   = 10             # wait 10m after close before re-entering
-REQUIRE_CONSENSUS = False       # single timeframe by default
+# ================= Default tunables (used as fallbacks; overridden by config inside main) =================
+DRY_RUN        = False
+ENTER_THRESH   = 0.62
+EXIT_THRESH    = 0.55
+MIN_HOLD_MIN   = 15
+COOLDOWN_MIN   = 10
+REQUIRE_CONSENSUS = False
 SKIP_IF_MINLOTS_EXCEEDS_RISK = True
-RISK_TOLERANCE_MULTIPLIER = 1.10  # allow slight over-budget to avoid near-miss skips
-MAGIC_NUMBER   = 202501         # to tag our deals/orders
+RISK_TOLERANCE_MULTIPLIER = 1.10   # small cushion to avoid near-miss skips
+MAGIC_NUMBER   = 202501
 
 # ================= Time helpers =================
 def now_utc() -> dt.datetime:
@@ -69,18 +68,51 @@ def fetch_bars(symbol: str, tf_code, count: int = 600) -> pd.DataFrame:
 # ================= Features & signal =================
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+
+    # Core indicators
     out["rsi14"] = rsi(out["close"], 14)
     m = macd(out["close"])
     out = out.join(m)
     out["rv96"] = realized_vol(out["close"], 96)
     out["atr14"] = atr(out, 14)
+
+    # Trend filter for symmetry (more shorts when trend/momentum are down)
+    out["ema50"]  = out["close"].ewm(span=50, adjust=False).mean()
+    out["ema200"] = out["close"].ewm(span=200, adjust=False).mean()
+
     out.dropna(inplace=True)
     return out
 
 def prob_up_from_feats(feats: pd.DataFrame) -> float:
-    sig = (-(feats["rsi14"].iloc[-1] - 50)/20.0 +
-           (feats["macd_hist"].iloc[-1] / (feats["rv96"].iloc[-1] + 1e-9)))
-    return float(1.0 / (1.0 + np.exp(-sig)))
+    """
+    Symmetric logit over trend/momentum/RSI:
+      - trend_term  > 0 (ema50 > ema200) pushes up; < 0 pushes down
+      - macd_term   normalized by RV (stable across regimes)
+      - rsi_term    above 50 is bearish weight, below 50 bullish weight
+    """
+    den = float(feats["rv96"].iloc[-1]) + 1e-9
+
+    macd_norm  = float(feats["macd_hist"].iloc[-1]) / den
+    trend_norm = float(feats["ema50"].iloc[-1] - feats["ema200"].iloc[-1]) / den
+
+    macd_term  = np.tanh(2.0 * macd_norm)      # [-1..1]
+    trend_term = np.tanh(1.2 * trend_norm)     # [-1..1]
+
+    rsi_dist   = (float(feats["rsi14"].iloc[-1]) - 50.0) / 20.0
+    rsi_term   = np.clip(rsi_dist, -2.0, 2.0)
+
+    logit = (0.8 * trend_term) + (0.6 * macd_term) - (0.6 * rsi_term)
+
+    price  = float(feats["close"].iloc[-1])
+    ema50  = float(feats["ema50"].iloc[-1])
+    ema200 = float(feats["ema200"].iloc[-1])
+    if price < min(ema50, ema200):
+        logit -= 0.10
+    elif price > max(ema50, ema200):
+        logit += 0.10
+
+    p_up = float(1.0 / (1.0 + np.exp(-logit)))
+    return p_up
 
 # ================= Account / execution =================
 def account_equity() -> float:
@@ -126,20 +158,16 @@ def close_symbol_positions(symbol: str):
         results.append(f"{pos.ticket}:{r.retcode}")
     return {"ok": True, "msg": ";".join(results)}
 
-# ---- SL/TP helper (ATR-based) ----
 def calc_sl_tp(side: int, price: float, atr_val: float, sl_mult: float, tp_mult: float) -> Tuple[float, float]:
     """
-    Returns (SL, TP) based on ATR, anchored to 'price' (entry tick):
+    ATR-based SL/TP anchored to 'price' (entry tick).
       - LONG:  SL = price - sl_mult*ATR, TP = price + tp_mult*ATR
       - SHORT: SL = price + sl_mult*ATR, TP = price - tp_mult*ATR
     """
     atr_val = float(atr_val or 0.0)
     if atr_val <= 0:
         point = 0.0001
-        if side > 0:
-            return price - point, price + point
-        else:
-            return price + point, price - point
+        return (price - point, price + point) if side > 0 else (price + point, price - point)
     if side > 0:
         return float(price - sl_mult * atr_val), float(price + tp_mult * atr_val)
     else:
@@ -160,9 +188,8 @@ def enforce_min_distance(symbol: str, side: int, entry: float, sl: float, tp: fl
         sl = max(sl, entry + min_dist)
         tp = min(tp, entry - min_dist)
     # snap to grid
-    if point > 0:
-        sl = round(sl / point) * point
-        tp = round(tp / point) * point
+    sl = round(sl / point) * point
+    tp = round(tp / point) * point
     return sl, tp
 
 def place_market_order(symbol: str, side: int, lots: float, sl: float | None=None, tp: float | None=None) -> dict:
@@ -171,7 +198,6 @@ def place_market_order(symbol: str, side: int, lots: float, sl: float | None=Non
     order_type = mt5.ORDER_TYPE_BUY if side > 0 else mt5.ORDER_TYPE_SELL
     price = tick.ask if side > 0 else tick.bid
 
-    # snap SL/TP to symbol grid if present
     point = float(getattr(info, "point", 0.0) or 0.0)
     if point > 0:
         if sl is not None: sl = round(sl / point) * point
@@ -241,7 +267,6 @@ def build_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, symbols: lis
             sym = getattr(d, "symbol", "")
             if sym not in per_symbol:
                 continue
-            # include commission and swap
             p  = float(getattr(d, "profit", 0.0) or 0.0)
             c  = float(getattr(d, "commission", 0.0) or 0.0)
             sw = float(getattr(d, "swap", 0.0) or 0.0)
@@ -286,9 +311,6 @@ def clamp_to_step(x: float, step: float, min_v: float, max_v: float) -> float:
     return round(steps * step, 3)
 
 def lots_for_risk(symbol: str, equity: float, stop_distance_price: float, bps: float) -> float:
-    """
-    Compute lots so loss at SL ≈ equity * (bps / 1e4), robust across MT5 builds.
-    """
     info = symbol_info_or_raise(symbol)
 
     tick_size = first_non_none(
@@ -351,45 +373,34 @@ def main():
     args = ap.parse_args()
 
     cfg = load_config()
-
-    # --- NEW: override strategy knobs safely from config.yaml ---
-    def _as_float(val, default):
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            return default
-
-    def _as_int(val, default):
-        try:
-            return int(val)
-        except (TypeError, ValueError):
-            return default
-
-    strat = cfg.get("strategy", {}) or {}
-
-    # Override global defaults (must declare as global if you want to overwrite them)
-    global ENTER_THRESH, EXIT_THRESH, MIN_HOLD_MIN, COOLDOWN_MIN
-    ENTER_THRESH = _as_float(strat.get("enter_thresh"), ENTER_THRESH)
-    EXIT_THRESH  = _as_float(strat.get("exit_thresh"),  EXIT_THRESH)
-    MIN_HOLD_MIN = _as_int  (strat.get("min_hold_min"), MIN_HOLD_MIN)
-    COOLDOWN_MIN = _as_int  (strat.get("cooldown_min"), COOLDOWN_MIN)
-    # ------------------------------------------------------------
-
     symbols = (args.symbols.split(",") if args.symbols else cfg.get("symbols", []))
     tfs = cfg.get("timeframes", ["M5"])
     assert all(tf in TF_MAP for tf in tfs), f"Unsupported TF in config; allowed {list(TF_MAP)}"
     tf_codes = {tf: TF_MAP[tf] for tf in tfs}
 
+    # --- Strategy knobs from config (safe locals; do not mutate globals) ---
+    def _as_float(v, d): 
+        try: return float(v)
+        except (TypeError, ValueError): return d
+    def _as_int(v, d): 
+        try: return int(v)
+        except (TypeError, ValueError): return d
+
+    strat = (cfg.get("strategy") or {})
+    enter_thresh = _as_float(strat.get("enter_thresh"), ENTER_THRESH)
+    exit_thresh  = _as_float(strat.get("exit_thresh"),  EXIT_THRESH)
+    min_hold_min = _as_int  (strat.get("min_hold_min"), MIN_HOLD_MIN)
+    cooldown_min = _as_int  (strat.get("cooldown_min"), COOLDOWN_MIN)
+
+    # --- Risk config ---
     risk_cfg = cfg["risk"]
-    sl_mult  = float(risk_cfg.get("stop_atr_mult", 1.8))
-    tp_mult  = float(risk_cfg.get("takeprofit_atr_mult", 2.5))
+    sl_mult  = float(risk_cfg.get("stop_atr_mult", 2.0))
+    tp_mult  = float(risk_cfg.get("takeprofit_atr_mult", 3.0))
     if tp_mult <= sl_mult:
-        logger.warning(f"takeprofit_atr_mult ({tp_mult}) <= stop_atr_mult ({sl_mult}); consider tp_mult > sl_mult for RR>1")
-
-    trade_bps = float(risk_cfg.get("max_risk_per_trade_bps", 60.0))  # 60 bps default
-
-    kill = risk_cfg["kill_switch"]
-    daily_dd_max   = float(kill.get("max_intraday_drawdown_pct", 2.0))
+        logger.warning(f"takeprofit_atr_mult ({tp_mult}) <= stop_atr_mult ({sl_mult}); prefer RR > 1")
+    trade_bps = float(risk_cfg.get("max_risk_per_trade_bps", 80.0))  # 0.8% default
+    kill = risk_cfg.get("kill_switch", {}) or {}
+    daily_dd_max   = float(kill.get("max_intraday_drawdown_pct", 4.0))
     max_trades_day = int(kill.get("max_daily_trades_per_symbol", 6))
 
     if not mt5.initialize():
@@ -427,7 +438,7 @@ def main():
     logger.info("🟢 Bot started (M5 FX, low-equity safe).")
 
     while True:
-        # New day: first send summary for the day that just ended, then reset
+        # New day: send summary then reset counters
         if now_utc() >= day_start + dt.timedelta(days=1):
             try:
                 end_ts = now_utc()
@@ -466,12 +477,11 @@ def main():
 
             tf_probs = {}
             tf_atr   = {}
-            tf_price = {}
             updated_any = False
 
             for tf in tfs:
-                df = fetch_bars(s, tf_codes[tf], count=400)  # M5: 400 bars ~ 33h
-                if df.empty or len(df) < 120:  # warmup
+                df = fetch_bars(s, tf_codes[tf], count=400)  # ~33h on M5
+                if df.empty or len(df) < 200:
                     continue
                 last = df.index[-1]
                 if last == last_bar_time[s][tf]:
@@ -483,13 +493,19 @@ def main():
                 if feats.empty:
                     continue
                 p = prob_up_from_feats(feats)
-                tf_probs[tf]  = p
-                tf_atr[tf]    = float(feats["atr14"].iloc[-1])
-                tf_price[tf]  = float(df["close"].iloc[-2])
+                tf_probs[tf] = p
+                tf_atr[tf]   = float(feats["atr14"].iloc[-1])
 
-                if p >= ENTER_THRESH: tf_side[s][tf] = +1
-                elif p <= 1 - ENTER_THRESH: tf_side[s][tf] = -1
-                else: tf_side[s][tf] = 0
+                # Optional debug:
+                # logger.debug(f"{s}/{tf}: p_up={p:.2f} emaΔ={feats['ema50'].iloc[-1]-feats['ema200'].iloc[-1]:.5f} "
+                #              f"macd={feats['macd_hist'].iloc[-1]:.6f} rsi={feats['rsi14'].iloc[-1]:.1f}")
+
+                if p >= enter_thresh:
+                    tf_side[s][tf] = +1
+                elif p <= 1.0 - enter_thresh:
+                    tf_side[s][tf] = -1
+                else:
+                    tf_side[s][tf] = 0
 
             if not updated_any:
                 continue
@@ -497,15 +513,17 @@ def main():
             # Combine TFs
             sides = [tf_side[s][tf] for tf in tfs]
             if REQUIRE_CONSENSUS and len(tfs) > 1:
-                if len(set([x for x in sides if x != 0])) == 1 and any(x != 0 for x in sides):
-                    raw_side = sides[0] if sides[0] != 0 else [x for x in sides if x != 0][0]
+                nonzero = [x for x in sides if x != 0]
+                if len(set(nonzero)) == 1 and nonzero:
+                    raw_side = nonzero[0]
                     size_factor = 1.0
                 else:
                     raw_side = 0
                     size_factor = 0.0
             else:
-                if any(x != 0 for x in sides):
-                    raw_side = [x for x in sides if x != 0][0]
+                nonzero = [x for x in sides if x != 0]
+                if nonzero:
+                    raw_side = nonzero[0]
                     size_factor = 1.0
                 else:
                     raw_side = 0
@@ -520,74 +538,75 @@ def main():
             nowt = now_utc()
             held_min = (nowt - last_open_time[s]).total_seconds() / 60.0
             cool_min = (nowt - last_close_time[s]).total_seconds() / 60.0
+            conf = float(np.median(list(tf_probs.values()))) if tf_probs else 0.5
+
             current = open_side[s]
             desired = current
 
             if current == 0:
-                if cool_min >= COOLDOWN_MIN:
-                    if raw_side > 0 and float(np.median(list(tf_probs.values()))) >= ENTER_THRESH:
+                if cool_min >= cooldown_min:
+                    if raw_side > 0 and conf >= enter_thresh:
                         desired = +1
-                    elif raw_side < 0 and float(np.median(list(tf_probs.values()))) >= ENTER_THRESH:
+                    elif raw_side < 0 and conf >= enter_thresh:
                         desired = -1
             else:
-                conf = float(np.median(list(tf_probs.values()))) if tf_probs else 0.5
-                if held_min >= MIN_HOLD_MIN:
-                    if conf <= EXIT_THRESH or raw_side == 0:
+                if held_min >= min_hold_min:
+                    if conf <= exit_thresh or raw_side == 0:
                         desired = 0
-                    elif raw_side != current and conf >= ENTER_THRESH:
+                    elif raw_side != current and conf >= enter_thresh:
                         desired = raw_side
 
             # ---------------- Execute if change ----------------
             if desired == current:
-                pass  # no action
+                continue
 
-            elif desired == 0:
+            if desired == 0:
                 if current != 0 and not DRY_RUN:
                     close_symbol_positions(s)
                 logger.info(f"{s}: FLAT (held {held_min:.1f}m)")
                 last_close_time[s] = nowt
                 open_side[s] = 0
                 trades_today[s] += 1
+                continue
 
-            else:
-                # If flipping, close first
-                if current != 0 and desired != current and not DRY_RUN:
-                    close_symbol_positions(s)
-                    last_close_time[s] = nowt
+            # Flip first if needed
+            if current != 0 and desired != current and not DRY_RUN:
+                close_symbol_positions(s)
+                last_close_time[s] = nowt
 
-                # Use LIVE TICK to anchor SL/TP and risk sizing
-                tick_now = mt5.symbol_info_tick(s)
-                if not tick_now:
-                    logger.warning(f"{s}: no tick, skipping")
+            # Live tick anchor for SL/TP & risk sizing
+            tick_now = mt5.symbol_info_tick(s)
+            if not tick_now:
+                logger.warning(f"{s}: no tick, skipping")
+                continue
+            entry_price = tick_now.ask if desired > 0 else tick_now.bid
+
+            sl, tp = calc_sl_tp(desired, entry_price, atr_use, sl_mult, tp_mult)
+            sl, tp = enforce_min_distance(s, desired, entry_price, sl, tp)
+
+            stop_dist = abs(entry_price - sl)
+            equity = account_equity()
+
+            lots_base = lots_for_risk(s, equity, stop_dist, trade_bps)
+            lots = max(round(lots_base * size_factor, 3), 0.01)
+
+            if SKIP_IF_MINLOTS_EXCEEDS_RISK:
+                risk_target = risk_dollars_from_bps(equity, trade_bps) * RISK_TOLERANCE_MULTIPLIER
+                est_risk = estimate_risk_dollars(s, lots, stop_dist)
+                if est_risk > risk_target + 1e-9:
+                    logger.info(f"{s}: SKIP — min lot risk ${est_risk:.2f} > target ${risk_target:.2f} "
+                                f"(stop={stop_dist:.5f}, lots={lots})")
                     continue
-                entry_price = tick_now.ask if desired > 0 else tick_now.bid
 
-                sl, tp = calc_sl_tp(desired, entry_price, atr_use, sl_mult, tp_mult)
-                sl, tp = enforce_min_distance(s, desired, entry_price, sl, tp)
+            resp = {"ok": True, "retcode": "DRY", "comment": "simulated"} if DRY_RUN \
+                   else place_market_order(s, desired, lots, sl=sl, tp=tp)
+            logger.info(f"{s}: {'LONG' if desired>0 else 'SHORT'} lots={lots:.2f} "
+                        f"SL={sl:.5f} TP={tp:.5f} (risk {trade_bps}bps) resp={resp}")
+            last_open_time[s] = nowt
+            open_side[s] = desired
+            trades_today[s] += 1
 
-                stop_dist = abs(entry_price - sl)
-                equity = account_equity()
-
-                lots_base = lots_for_risk(s, equity, stop_dist, trade_bps)
-                lots = max(round(lots_base * size_factor, 3), 0.01)
-
-                if SKIP_IF_MINLOTS_EXCEEDS_RISK:
-                    risk_target = risk_dollars_from_bps(equity, trade_bps) * RISK_TOLERANCE_MULTIPLIER
-                    est_risk = estimate_risk_dollars(s, lots, stop_dist)
-                    if est_risk > risk_target + 1e-9:
-                        logger.info(f"{s}: SKIP — min lot risk ${est_risk:.2f} > target ${risk_target:.2f} "
-                                    f"(stop={stop_dist:.5f}, lots={lots})")
-                        continue
-
-                resp = {"ok": True, "retcode": "DRY", "comment": "simulated"} if DRY_RUN \
-                       else place_market_order(s, desired, lots, sl=sl, tp=tp)
-                logger.info(f"{s}: {'LONG' if desired>0 else 'SHORT'} lots={lots} "
-                            f"SL={sl:.5f} TP={tp:.5f} (risk {trade_bps}bps) resp={resp}")
-                last_open_time[s] = nowt
-                open_side[s] = desired
-                trades_today[s] += 1
-
-        time.sleep(30)  # M5 cadence, ~2 checks per minute
+        time.sleep(30)  # ~2 checks per minute on M5
 
 if __name__ == "__main__":
     main()

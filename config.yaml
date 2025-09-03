@@ -20,15 +20,9 @@ trading_window:
   end_hour_utc: 20                     # London/NY overlap
 
 strategy:
-  # How long to keep a position before we even consider closing (minutes)
-  min_hold_min: 30
-
-  # Confidence threshold to EXIT early after min_hold_min has passed
-  # Lower = requires a stronger reversal to close (0.45 is stricter than 0.55)
+  enter_thresh: 0.58   # looser than 0.62 → more shorts will pass
   exit_thresh: 0.45
-
-  # (Optional) If you want to tweak these via config too:
-  enter_thresh: 0.62
+  min_hold_min: 30
   cooldown_min: 10
 
 
