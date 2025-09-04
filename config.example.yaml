@@ -22,3 +22,6 @@ news:
   news_api_key_env: "NEWS_API_KEY"
   keywords: ["forex", "currency", "central bank", "interest rates", "inflation", "GDP", "fed", "ecb"]
   sources: [] # Optional: e.g., ["reuters", "bloomberg"]
+fundamental:
+  enabled: true
+  importances: ["high", "medium"] # high, medium, low

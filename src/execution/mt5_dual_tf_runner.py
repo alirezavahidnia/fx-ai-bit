@@ -22,6 +22,9 @@ load_dotenv()
 
 from ..utils.config import load_config
 from ..features.technical import rsi, macd, realized_vol, atr
+from ..features.news_fetcher import NewsFetcher
+from ..features.fundamental import get_economic_calendar
+from ..features.sentiment import FinBertSentiment, hawk_dove_score, aggregate_currency_sentiment
 
 # ================= Default tunables (used as fallbacks; overridden by config inside main) =================
 DRY_RUN        = False
@@ -113,6 +116,59 @@ def prob_up_from_feats(feats: pd.DataFrame) -> float:
 
     p_up = float(1.0 / (1.0 + np.exp(-logit)))
     return p_up
+
+def get_final_trade_decision(
+    p_up_tech: float,
+    symbol: str,
+    sentiment: Dict[str, float],
+    events: pd.DataFrame,
+    event_lookahead_min: int = 45,
+    sentiment_strength_factor: float = 0.2,
+) -> Tuple[float, bool]:
+    """
+    Combines technical, sentiment, and fundamental signals into a final decision.
+    """
+    base_curr, quote_curr = symbol[:3], symbol[3:]
+
+    # 1. Sentiment Adjustment
+    base_sentiment = sentiment.get(base_curr, 0.0)
+    quote_sentiment = sentiment.get(quote_curr, 0.0)
+    net_sentiment = base_sentiment - quote_sentiment  # e.g., EUR/USD: if EUR is positive and USD is negative, this is bullish.
+    sentiment_adjustment = net_sentiment * sentiment_strength_factor
+    p_up_adjusted = p_up_tech + sentiment_adjustment
+    p_up_adjusted = np.clip(p_up_adjusted, 0.0, 1.0)
+
+    # 2. Fundamental Event Check
+    trade_allowed = True
+    if not events.empty:
+        now = pd.Timestamp.utcnow()
+        # The 'time' column in events is a string, needs parsing.
+        # Assuming 'time' is like 'HH:MM' or 'All Day'. We need robust parsing.
+        for _, event in events.iterrows():
+            event_time_str = event.get('time', '')
+            if event_time_str and event_time_str.lower() != 'all day':
+                try:
+                    event_date_str = event.get('date', '')
+                    if event_time_str and event_date_str and event_time_str.lower() != 'all day':
+                        # Combine date and time and parse together, assuming UTC
+                        event_dt = pd.to_datetime(f"{event_date_str} {event_time_str}", format='%d/%m/%Y %H:%M', utc=True)
+
+                        time_to_event_min = (event_dt - now).total_seconds() / 60.0
+
+                        if 0 < time_to_event_min < event_lookahead_min:
+                            event_curr = event.get('currency', '').upper()
+                            if event_curr in [base_curr, quote_curr]:
+                                logger.warning(f"[{symbol}] Blocking trade due to upcoming high-impact event: {event['event']} for {event_curr} in {time_to_event_min:.1f} minutes.")
+                                trade_allowed = False
+                                break
+                except (ValueError, TypeError) as e:
+                    logger.warning(f"Could not parse event date/time for event: {event.get('event')}. Error: {e}")
+                    continue
+
+    if p_up_adjusted != p_up_tech:
+        logger.info(f"[{symbol}] Sentiment adjusted p_up: {p_up_tech:.2f} -> {p_up_adjusted:.2f} (net_sentiment={net_sentiment:.2f})")
+
+    return p_up_adjusted, trade_allowed
 
 # ================= Account / execution =================
 def account_equity() -> float:
@@ -403,6 +459,36 @@ def main():
     daily_dd_max   = float(kill.get("max_intraday_drawdown_pct", 4.0))
     max_trades_day = int(kill.get("max_daily_trades_per_symbol", 6))
 
+    # --- News and Sentiment config ---
+    news_cfg = cfg.get("news", {})
+    news_enabled = news_cfg.get("enabled", False)
+    news_fetcher = None
+    sentiment_analyzer = None
+    if news_enabled:
+        news_api_key = os.getenv(news_cfg.get("news_api_key_env", "NEWS_API_KEY"))
+        if not news_api_key:
+            logger.warning("News feature is enabled, but NEWS_API_KEY is not set. Disabling.")
+            news_enabled = False
+        else:
+            try:
+                news_fetcher = NewsFetcher(api_key=news_api_key)
+                sentiment_analyzer = FinBertSentiment() # This will download the model on first run
+                news_keywords = news_cfg.get("keywords", [])
+                news_sources = news_cfg.get("sources", [])
+                logger.info("News and sentiment analysis enabled.")
+            except Exception as e:
+                logger.exception(f"Failed to initialize sentiment analyzer, disabling news feature: {e}")
+                news_enabled = False
+
+    # --- Fundamental Analysis config ---
+    fundamental_cfg = cfg.get("fundamental", {})
+    fundamental_enabled = fundamental_cfg.get("enabled", True)
+    if fundamental_enabled:
+        all_currencies = list(set([s[:3] for s in symbols] + [s[3:] for s in symbols]))
+        calendar_importances = fundamental_cfg.get("importances", ["high"])
+        logger.info(f"Fundamental analysis enabled for currencies: {all_currencies}")
+
+
     if not mt5.initialize():
         raise RuntimeError(f"MetaTrader5 initialize() failed: {mt5.last_error()}")
     logger.info(f"MT5 initialized. Symbols={symbols} TFs={tfs}")
@@ -435,11 +521,56 @@ def main():
     equity_day_open = account_equity()
     paused_for_dd = False
 
+    # --- External data state ---
+    last_news_fetch_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    last_calendar_fetch_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    currency_sentiment = {c: 0.0 for c in all_currencies} if fundamental_enabled else {}
+    upcoming_events = pd.DataFrame()
+
     logger.info("🟢 Bot started (M5 FX, low-equity safe).")
 
     while True:
+        nowt_loop = now_utc()
+
+        # --- Fetch News & Sentiment periodically ---
+        if news_enabled and (nowt_loop - last_news_fetch_time).total_seconds() >= 30 * 60:
+            logger.info("Fetching news for sentiment analysis...")
+            try:
+                articles = news_fetcher.fetch_forex_news(keywords=news_keywords, sources=news_sources)
+                if articles:
+                    # Convert 'publishedAt' string to datetime object
+                    for art in articles:
+                        art['timestamp'] = dt.datetime.fromisoformat(art['publishedAt'].replace('Z', '+00:00'))
+
+                    # Simple currency mention logic
+                    for art in articles:
+                        art['currencies'] = [c for c in all_currencies if c.lower() in art['title'].lower() or c.lower() in art['description'].lower()]
+
+                    # Analyze sentiment
+                    for art in articles:
+                        art['sentiment'] = sentiment_analyzer.score(art['title'] + " " + art['description'])
+
+                    # Aggregate sentiment per currency
+                    currency_sentiment = aggregate_currency_sentiment(articles)
+                    logger.info(f"Updated currency sentiment: {currency_sentiment}")
+
+            except Exception as e:
+                logger.exception(f"Error during news fetch/sentiment analysis: {e}")
+            last_news_fetch_time = nowt_loop
+
+        # --- Fetch Economic Calendar periodically ---
+        if fundamental_enabled and (nowt_loop - last_calendar_fetch_time).total_seconds() >= 60 * 60:
+            logger.info("Fetching economic calendar...")
+            try:
+                upcoming_events = get_economic_calendar(all_currencies, calendar_importances)
+                if not upcoming_events.empty:
+                    logger.info(f"Found {len(upcoming_events)} upcoming economic events.")
+            except Exception as e:
+                logger.exception(f"Error during economic calendar fetch: {e}")
+            last_calendar_fetch_time = nowt_loop
+
         # New day: send summary then reset counters
-        if now_utc() >= day_start + dt.timedelta(days=1):
+        if nowt_loop >= day_start + dt.timedelta(days=1):
             try:
                 end_ts = now_utc()
                 summary = build_daily_summary(day_start, end_ts, symbols)
@@ -492,17 +623,34 @@ def main():
                 feats = build_features(df.iloc[:-1])  # closed bar only
                 if feats.empty:
                     continue
-                p = prob_up_from_feats(feats)
-                tf_probs[tf] = p
+                p_tech = prob_up_from_feats(feats)
+
+                # Get final decision with sentiment and fundamentals
+                p_final, trade_allowed = get_final_trade_decision(
+                    p_tech, s, currency_sentiment, upcoming_events
+                )
+
+                if not trade_allowed:
+                    if open_side[s] != 0:
+                        logger.warning(f"[{s}] Closing position due to upcoming event.")
+                        if not DRY_RUN:
+                            close_symbol_positions(s)
+                        last_close_time[s] = now_utc()
+                        open_side[s] = 0
+                        trades_today[s] += 1
+                    tf_side[s][tf] = 0 # Prevent new trades
+                    continue
+
+                tf_probs[tf] = p_final
                 tf_atr[tf]   = float(feats["atr14"].iloc[-1])
 
                 # Optional debug:
-                # logger.debug(f"{s}/{tf}: p_up={p:.2f} emaΔ={feats['ema50'].iloc[-1]-feats['ema200'].iloc[-1]:.5f} "
+                # logger.debug(f"{s}/{tf}: p_tech={p_tech:.2f} p_final={p_final:.2f} emaΔ={feats['ema50'].iloc[-1]-feats['ema200'].iloc[-1]:.5f} "
                 #              f"macd={feats['macd_hist'].iloc[-1]:.6f} rsi={feats['rsi14'].iloc[-1]:.1f}")
 
-                if p >= enter_thresh:
+                if p_final >= enter_thresh:
                     tf_side[s][tf] = +1
-                elif p <= 1.0 - enter_thresh:
+                elif p_final <= 1.0 - enter_thresh:
                     tf_side[s][tf] = -1
                 else:
                     tf_side[s][tf] = 0
