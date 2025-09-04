@@ -17,6 +17,7 @@ alerts:
   telegram_enabled: true
   telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
   telegram_chat_id_env: "TELEGRAM_CHAT_ID"
+  alert_on_trade_close: true
 news:
   enabled: true
   # --- Provider: newsapi.org ---

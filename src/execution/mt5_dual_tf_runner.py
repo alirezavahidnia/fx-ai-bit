@@ -186,15 +186,18 @@ def symbol_info_or_raise(symbol: str):
         mt5.symbol_select(symbol, True)
     return info
 
-def close_symbol_positions(symbol: str):
+def close_symbol_positions(symbol: str) -> dict:
     positions = mt5.positions_get(symbol=symbol)
     if positions is None:
         logger.error(f"positions_get({symbol}) failed: {mt5.last_error()}")
-        return {"ok": False, "msg": str(mt5.last_error())}
+        return {"ok": False, "msg": str(mt5.last_error()), "closed_tickets": []}
     if len(positions) == 0:
-        return {"ok": True, "msg": "no positions"}
+        return {"ok": True, "msg": "no positions", "closed_tickets": []}
+
     tick = mt5.symbol_info_tick(symbol)
     results = []
+    closed_tickets = [pos.ticket for pos in positions]
+
     for pos in positions:
         lot = pos.volume
         deal_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
@@ -213,7 +216,7 @@ def close_symbol_positions(symbol: str):
         }
         r = mt5.order_send(req)
         results.append(f"{pos.ticket}:{r.retcode}")
-    return {"ok": True, "msg": ";".join(results)}
+    return {"ok": True, "msg": ";".join(results), "closed_tickets": closed_tickets}
 
 def calc_sl_tp(side: int, price: float, atr_val: float, sl_mult: float, tp_mult: float) -> Tuple[float, float]:
     """
@@ -348,6 +351,20 @@ def format_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, sym_summary
     lines.append("<b>By symbol:</b>")
     for s, v in sym_summary["per_symbol"].items():
         lines.append(f"• {s}: {human_pl(v)}")
+    return "\n".join(lines)
+
+def format_trade_close_alert(deal: mt5.TradeDeal) -> str:
+    """Formats a message for a single closed trade."""
+    side_closed = "BUY" if deal.type == mt5.DEAL_TYPE_SELL else "SELL"
+    pnl = deal.profit + deal.commission + deal.swap
+
+    lines = []
+    lines.append(f"<b>🔔 Trade Closed: {deal.symbol}</b>")
+    lines.append(f"<b>Direction:</b> {side_closed}")
+    lines.append(f"<b>Profit/Loss:</b> {human_pl(pnl)}")
+    lines.append(f"<b>Volume:</b> {deal.volume:.2f}")
+    lines.append(f"<b>Close Price:</b> {deal.price:.5f}")
+
     return "\n".join(lines)
 
 # ================= Robust lot sizing (FX-friendly) =================
@@ -543,6 +560,7 @@ def main():
     last_calendar_fetch_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
     currency_sentiment = {c: 0.0 for c in all_currencies} if fundamental_enabled else {}
     upcoming_events = pd.DataFrame()
+    pending_alerts = set()
 
     logger.info("🟢 Bot started (M5 FX, low-equity safe).")
 
@@ -584,6 +602,25 @@ def main():
             except Exception as e:
                 logger.exception(f"Error during economic calendar fetch: {e}")
             last_calendar_fetch_time = nowt_loop
+
+        # --- Process pending trade close alerts ---
+        if pending_alerts and cfg.get("alerts", {}).get("alert_on_trade_close"):
+            # Fetch deals from the start of the bot run to be safe
+            deals = mt5.history_deals_get(day_start, nowt_loop)
+            if deals:
+                processed_alerts = set()
+                for deal in deals:
+                    if deal.position_id in pending_alerts and deal.entry == mt5.DEAL_ENTRY_OUT:
+                        try:
+                            msg = format_trade_close_alert(deal)
+                            send_telegram_alert(cfg, msg)
+                            processed_alerts.add(deal.position_id)
+                        except Exception as e:
+                            logger.exception(f"Failed to send trade close alert for deal {deal.ticket}: {e}")
+
+                if processed_alerts:
+                    pending_alerts.difference_update(processed_alerts)
+
 
         # New day: send summary then reset counters
         if nowt_loop >= day_start + dt.timedelta(days=1):
@@ -650,7 +687,9 @@ def main():
                     if open_side[s] != 0:
                         logger.warning(f"[{s}] Closing position due to upcoming event.")
                         if not DRY_RUN:
-                            close_symbol_positions(s)
+                            close_result = close_symbol_positions(s)
+                            if close_result.get("closed_tickets"):
+                                pending_alerts.update(close_result["closed_tickets"])
                         last_close_time[s] = now_utc()
                         open_side[s] = 0
                         trades_today[s] += 1
@@ -726,7 +765,9 @@ def main():
 
             if desired == 0:
                 if current != 0 and not DRY_RUN:
-                    close_symbol_positions(s)
+                    close_result = close_symbol_positions(s)
+                    if close_result.get("closed_tickets"):
+                        pending_alerts.update(close_result["closed_tickets"])
                 logger.info(f"{s}: FLAT (held {held_min:.1f}m)")
                 last_close_time[s] = nowt
                 open_side[s] = 0
@@ -735,7 +776,9 @@ def main():
 
             # Flip first if needed
             if current != 0 and desired != current and not DRY_RUN:
-                close_symbol_positions(s)
+                close_result = close_symbol_positions(s)
+                if close_result.get("closed_tickets"):
+                    pending_alerts.update(close_result["closed_tickets"])
                 last_close_time[s] = nowt
 
             # Live tick anchor for SL/TP & risk sizing
