@@ -26,6 +26,7 @@ from ..features.news_fetcher import NewsFetcher
 from ..features.alpha_vantage_fetcher import AlphaVantageFetcher
 from ..features.fundamental import get_economic_calendar
 from ..features.sentiment import FinBertSentiment, hawk_dove_score, aggregate_currency_sentiment
+from ..utils.trade_logger import TradeLogger
 
 # ================= Default tunables (used as fallbacks; overridden by config inside main) =================
 DRY_RUN        = False
@@ -125,35 +126,41 @@ def get_final_trade_decision(
     events: pd.DataFrame,
     event_lookahead_min: int = 45,
     sentiment_strength_factor: float = 0.2,
-) -> Tuple[float, bool]:
+) -> Tuple[float, bool, dict]:
     """
     Combines technical, sentiment, and fundamental signals into a final decision.
+    Returns the final probability, a trade_allowed flag, and a dictionary of features for logging.
     """
     base_curr, quote_curr = symbol[:3], symbol[3:]
+    features = {}
 
     # 1. Sentiment Adjustment
     base_sentiment = sentiment.get(base_curr, 0.0)
     quote_sentiment = sentiment.get(quote_curr, 0.0)
-    net_sentiment = base_sentiment - quote_sentiment  # e.g., EUR/USD: if EUR is positive and USD is negative, this is bullish.
+    net_sentiment = base_sentiment - quote_sentiment
     sentiment_adjustment = net_sentiment * sentiment_strength_factor
     p_up_adjusted = p_up_tech + sentiment_adjustment
     p_up_adjusted = np.clip(p_up_adjusted, 0.0, 1.0)
+
+    features.update({
+        'technical_p_up': p_up_tech,
+        'final_p_up': p_up_adjusted,
+        'base_sentiment': base_sentiment,
+        'quote_sentiment': quote_sentiment,
+        'net_sentiment': net_sentiment,
+    })
 
     # 2. Fundamental Event Check
     trade_allowed = True
     if not events.empty:
         now = pd.Timestamp.utcnow()
-        # The 'time' column in events is a string, needs parsing.
-        # Assuming 'time' is like 'HH:MM' or 'All Day'. We need robust parsing.
         for _, event in events.iterrows():
             event_time_str = event.get('time', '')
             if event_time_str and event_time_str.lower() != 'all day':
                 try:
                     event_date_str = event.get('date', '')
                     if event_time_str and event_date_str and event_time_str.lower() != 'all day':
-                        # Combine date and time and parse together, assuming UTC
                         event_dt = pd.to_datetime(f"{event_date_str} {event_time_str}", format='%d/%m/%Y %H:%M', utc=True)
-
                         time_to_event_min = (event_dt - now).total_seconds() / 60.0
 
                         if 0 < time_to_event_min < event_lookahead_min:
@@ -169,7 +176,7 @@ def get_final_trade_decision(
     if p_up_adjusted != p_up_tech:
         logger.info(f"[{symbol}] Sentiment adjusted p_up: {p_up_tech:.2f} -> {p_up_adjusted:.2f} (net_sentiment={net_sentiment:.2f})")
 
-    return p_up_adjusted, trade_allowed
+    return p_up_adjusted, trade_allowed, features
 
 # ================= Account / execution =================
 def account_equity() -> float:
@@ -281,8 +288,12 @@ def place_market_order(symbol: str, side: int, lots: float, sl: float | None=Non
         return {"ok": True, "retcode": "DRY", "comment": "simulated"}
 
     result = mt5.order_send(req)
-    return {"ok": result.retcode == mt5.TRADE_RETCODE_DONE,
-            "retcode": result.retcode, "comment": result.comment}
+    return {
+        "ok": result.retcode == mt5.TRADE_RETCODE_DONE,
+        "retcode": result.retcode,
+        "comment": result.comment,
+        "deal_id": result.deal if result else None
+    }
 
 # ---------- Telegram: DAILY SUMMARY ONLY ----------
 def _tg_creds(cfg):
@@ -561,6 +572,7 @@ def main():
     currency_sentiment = {c: 0.0 for c in all_currencies} if fundamental_enabled else {}
     upcoming_events = pd.DataFrame()
     pending_alerts = set()
+    trade_logger = TradeLogger()
 
     logger.info("🟢 Bot started (M5 FX, low-equity safe).")
 
@@ -612,11 +624,16 @@ def main():
                 for deal in deals:
                     if deal.position_id in pending_alerts and deal.entry == mt5.DEAL_ENTRY_OUT:
                         try:
+                            # Log the close event
+                            pnl = deal.profit + deal.commission + deal.swap
+                            trade_logger.log_close_trade(deal.position_id, pnl)
+
+                            # Send Telegram alert
                             msg = format_trade_close_alert(deal)
                             send_telegram_alert(cfg, msg)
                             processed_alerts.add(deal.position_id)
                         except Exception as e:
-                            logger.exception(f"Failed to send trade close alert for deal {deal.ticket}: {e}")
+                            logger.exception(f"Failed to process trade close event for deal {deal.ticket}: {e}")
 
                 if processed_alerts:
                     pending_alerts.difference_update(processed_alerts)
@@ -805,10 +822,30 @@ def main():
                                 f"(stop={stop_dist:.5f}, lots={lots})")
                     continue
 
-            resp = {"ok": True, "retcode": "DRY", "comment": "simulated"} if DRY_RUN \
+            resp = {"ok": True, "retcode": "DRY", "comment": "simulated", "deal_id": None} if DRY_RUN \
                    else place_market_order(s, desired, lots, sl=sl, tp=tp)
+
             logger.info(f"{s}: {'LONG' if desired>0 else 'SHORT'} lots={lots:.2f} "
                         f"SL={sl:.5f} TP={tp:.5f} (risk {trade_bps}bps) resp={resp}")
+
+            if resp.get("ok") and resp.get("deal_id"):
+                time.sleep(0.5) # Give a moment for the deal to be recorded in history
+                deal = mt5.history_deals_get(ticket=resp["deal_id"])
+                if deal and len(deal) == 1:
+                    position_id = deal[0].position_id
+
+                    # Log the trade decision context
+                    log_features = features.copy()
+                    log_features.update({
+                        'rsi14': feats["rsi14"].iloc[-1],
+                        'macd_hist': feats["macd_hist"].iloc[-1],
+                        'rv96': feats["rv96"].iloc[-1],
+                        'ema_dist_norm': (feats["ema50"].iloc[-1] - feats["ema200"].iloc[-1]) / (float(feats["rv96"].iloc[-1]) + 1e-9),
+                    })
+                    trade_logger.log_open_trade(position_id, s, desired, lots, entry_price, sl, tp, log_features)
+                else:
+                    logger.warning(f"[{s}] Could not retrieve deal details for deal_id {resp['deal_id']} to log trade open.")
+
             last_open_time[s] = nowt
             open_side[s] = desired
             trades_today[s] += 1
