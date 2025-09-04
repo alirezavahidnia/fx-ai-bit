@@ -696,7 +696,7 @@ def main():
                 p_tech = prob_up_from_feats(feats)
 
                 # Get final decision with sentiment and fundamentals
-                p_final, trade_allowed = get_final_trade_decision(
+                p_final, trade_allowed, features = get_final_trade_decision(
                     p_tech, s, currency_sentiment, upcoming_events
                 )
 
