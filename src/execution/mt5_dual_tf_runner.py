@@ -23,6 +23,7 @@ load_dotenv()
 from ..utils.config import load_config
 from ..features.technical import rsi, macd, realized_vol, atr
 from ..features.news_fetcher import NewsFetcher
+from ..features.alpha_vantage_fetcher import AlphaVantageFetcher
 from ..features.fundamental import get_economic_calendar
 from ..features.sentiment import FinBertSentiment, hawk_dove_score, aggregate_currency_sentiment
 
@@ -462,23 +463,39 @@ def main():
     # --- News and Sentiment config ---
     news_cfg = cfg.get("news", {})
     news_enabled = news_cfg.get("enabled", False)
+    news_provider = news_cfg.get("provider", "newsapi")
     news_fetcher = None
     sentiment_analyzer = None
+
     if news_enabled:
-        news_api_key = os.getenv(news_cfg.get("news_api_key_env", "NEWS_API_KEY"))
-        if not news_api_key:
-            logger.warning("News feature is enabled, but NEWS_API_KEY is not set. Disabling.")
-            news_enabled = False
-        else:
-            try:
-                news_fetcher = NewsFetcher(api_key=news_api_key)
-                sentiment_analyzer = FinBertSentiment() # This will download the model on first run
-                news_keywords = news_cfg.get("keywords", [])
-                news_sources = news_cfg.get("sources", [])
-                logger.info("News and sentiment analysis enabled.")
-            except Exception as e:
-                logger.exception(f"Failed to initialize sentiment analyzer, disabling news feature: {e}")
+        if news_provider == "alphavantage":
+            api_key = os.getenv(news_cfg.get("alpha_vantage_api_key_env", "ALPHA_VANTAGE_API_KEY"))
+            if not api_key:
+                logger.warning("News provider is 'alphavantage' but ALPHA_VANTAGE_API_KEY is not set. Disabling news.")
                 news_enabled = False
+            else:
+                news_fetcher = AlphaVantageFetcher(api_key=api_key)
+                logger.info("News provider set to Alpha Vantage.")
+        elif news_provider == "newsapi":
+            api_key = os.getenv(news_cfg.get("news_api_key_env", "NEWS_API_KEY"))
+            if not api_key:
+                logger.warning("News provider is 'newsapi' but NEWS_API_KEY is not set. Disabling news.")
+                news_enabled = False
+            else:
+                try:
+                    news_fetcher = NewsFetcher(api_key=api_key)
+                    sentiment_analyzer = FinBertSentiment()
+                    logger.info("News provider set to NewsAPI with FinBERT sentiment.")
+                except Exception as e:
+                    logger.exception(f"Failed to initialize FinBERT, disabling news feature: {e}")
+                    news_enabled = False
+        else:
+            logger.warning(f"Unknown news provider '{news_provider}'. Disabling news feature.")
+            news_enabled = False
+
+        news_keywords = news_cfg.get("keywords", [])
+        news_sources = news_cfg.get("sources", []) # Only used by newsapi
+        news_topics = news_cfg.get("topics", ["forex", "economy_monetary"]) # Only used by alphavantage
 
     # --- Fundamental Analysis config ---
     fundamental_cfg = cfg.get("fundamental", {})
@@ -533,24 +550,23 @@ def main():
         nowt_loop = now_utc()
 
         # --- Fetch News & Sentiment periodically ---
-        if news_enabled and (nowt_loop - last_news_fetch_time).total_seconds() >= 30 * 60:
-            logger.info("Fetching news for sentiment analysis...")
+        if news_enabled and news_fetcher and (nowt_loop - last_news_fetch_time).total_seconds() >= 30 * 60:
+            logger.info(f"Fetching news from provider: {news_provider}...")
             try:
-                articles = news_fetcher.fetch_forex_news(keywords=news_keywords, sources=news_sources)
+                articles = []
+                if news_provider == 'alphavantage':
+                    av_tickers = [f"FOREX:{c}" for c in all_currencies]
+                    articles = news_fetcher.fetch_forex_news(topics=news_topics, tickers=av_tickers)
+                elif news_provider == 'newsapi':
+                    articles = news_fetcher.fetch_forex_news(keywords=news_keywords, sources=news_sources)
+                    if articles:
+                        # Post-process for newsapi
+                        for art in articles:
+                            art['timestamp'] = dt.datetime.fromisoformat(art['publishedAt'].replace('Z', '+00:00'))
+                            art['currencies'] = [c for c in all_currencies if c.lower() in (art.get('title','').lower() or '') or c.lower() in (art.get('description','').lower() or '')]
+                            art['sentiment'] = sentiment_analyzer.score(art.get('title','') + " " + art.get('description',''))
+
                 if articles:
-                    # Convert 'publishedAt' string to datetime object
-                    for art in articles:
-                        art['timestamp'] = dt.datetime.fromisoformat(art['publishedAt'].replace('Z', '+00:00'))
-
-                    # Simple currency mention logic
-                    for art in articles:
-                        art['currencies'] = [c for c in all_currencies if c.lower() in art['title'].lower() or c.lower() in art['description'].lower()]
-
-                    # Analyze sentiment
-                    for art in articles:
-                        art['sentiment'] = sentiment_analyzer.score(art['title'] + " " + art['description'])
-
-                    # Aggregate sentiment per currency
                     currency_sentiment = aggregate_currency_sentiment(articles)
                     logger.info(f"Updated currency sentiment: {currency_sentiment}")
 

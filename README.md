@@ -63,7 +63,10 @@ Optimized for **low-equity accounts** and tuned for the **M5 timeframe**.
    ```ini
    TELEGRAM_BOT_TOKEN=your_bot_token
    TELEGRAM_CHAT_ID=your_chat_id
-   NEWS_API_KEY=your_news_api_key
+
+   # --- CHOOSE ONE NEWS PROVIDER ---
+   NEWS_API_KEY=your_newsapi_key_from_newsapi.org
+   ALPHA_VANTAGE_API_KEY=your_alphavantage_key
    ```
 
 5. **Run the bot**:
