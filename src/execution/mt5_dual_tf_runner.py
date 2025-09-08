@@ -331,15 +331,31 @@ def clamp_to_step(x: float, step: float, min_v: float, max_v: float) -> float:
 
 def lots_for_risk(symbol: str, equity: float, stop_distance_price: float, bps: float) -> float:
     info = symbol_info_or_raise(symbol)
-    tick_size = first_non_none(info.trade_tick_size, info.tick_size, info.point)
-    tick_value = first_non_none(info.trade_tick_value, info.tick_value, (info.point * info.trade_contract_size) or None)
-    vol_min, vol_step, vol_max = info.volume_min, info.volume_step, info.volume_max
+
+    # Safely get attributes that might be missing from the broker's data
+    point = getattr(info, 'point', 0.00001)
+    trade_tick_size = getattr(info, 'trade_tick_size', None)
+    tick_size_val = getattr(info, 'tick_size', None)
+
+    trade_tick_value = getattr(info, 'trade_tick_value', None)
+    tick_value_val = getattr(info, 'tick_value', None)
+    contract_size = getattr(info, 'trade_contract_size', 0)
+
+    tick_size = first_non_none(trade_tick_size, tick_size_val, point)
+    tick_value = first_non_none(trade_tick_value, tick_value_val, (point * contract_size) or None)
+
+    vol_min = getattr(info, 'volume_min', 0.01)
+    vol_step = getattr(info, 'volume_step', 0.01)
+    vol_max = getattr(info, 'volume_max', 100.0)
 
     if not all([tick_size, tick_value, stop_distance_price > 0]):
+        logger.warning(f"[{symbol}] Sizing fallback due to missing info: tick_size={tick_size}, tick_value={tick_value}, stop_dist={stop_distance_price}")
         return clamp_to_step(0.01, vol_step, vol_min, vol_max)
 
     risk_per_lot = (stop_distance_price / tick_size) * tick_value
-    if risk_per_lot <= 0: return clamp_to_step(0.01, vol_step, vol_min, vol_max)
+    if risk_per_lot <= 0:
+        logger.warning(f"[{symbol}] risk_per_lot<=0 fallback; tick_size={tick_size}, tick_value={tick_value}")
+        return clamp_to_step(0.01, vol_step, vol_min, vol_max)
 
     risk_target = risk_dollars_from_bps(equity, bps)
     lots_raw = risk_target / risk_per_lot
@@ -349,9 +365,22 @@ def lots_for_risk(symbol: str, equity: float, stop_distance_price: float, bps: f
 
 def estimate_risk_dollars(symbol: str, lots: float, stop_distance_price: float) -> float:
     info = symbol_info_or_raise(symbol)
-    tick_size = first_non_none(info.trade_tick_size, info.tick_size, info.point)
-    tick_value = first_non_none(info.trade_tick_value, info.tick_value, (info.point * info.trade_contract_size) or None)
-    if not all([tick_size, tick_value, stop_distance_price > 0]): return float("inf")
+
+    # Safely get attributes
+    point = getattr(info, 'point', 0.00001)
+    trade_tick_size = getattr(info, 'trade_tick_size', None)
+    tick_size_val = getattr(info, 'tick_size', None)
+
+    trade_tick_value = getattr(info, 'trade_tick_value', None)
+    tick_value_val = getattr(info, 'tick_value', None)
+    contract_size = getattr(info, 'trade_contract_size', 0)
+
+    tick_size = first_non_none(trade_tick_size, tick_size_val, point)
+    tick_value = first_non_none(trade_tick_value, tick_value_val, (point * contract_size) or None)
+
+    if not all([tick_size, tick_value, stop_distance_price > 0]):
+        return float("inf")
+
     return (stop_distance_price / tick_size) * tick_value * lots
 
 # ================= Main Execution Logic =================
