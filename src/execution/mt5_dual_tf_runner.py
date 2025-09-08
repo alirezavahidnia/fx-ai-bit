@@ -1,14 +1,13 @@
 # MT5 runner for low-equity FX on M5.
-# - Symmetric probability (EMA50/EMA200 + MACD/RV + RSI) for balanced longs/shorts
-# - ATR-based SL/TP anchored to LIVE tick price; respects broker min distances
-# - Risk-based lot sizing + skip if min-lot exceeds risk budget (with small tolerance)
-# - Min-hold + cooldown + hysteresis; config-driven strategy thresholds
-# - Daily drawdown kill-switch + daily trade cap
-# - Telegram: DAILY SUMMARY ONLY (no per-trade alerts)
+# - Combines technical, fundamental (events), and sentiment (news) analysis.
+# - Data fetching (news, events) runs in a non-blocking background thread.
+# - ATR-based SL/TP, risk-based lot sizing, daily DD kill-switch.
 
 from __future__ import annotations
 import os, time, argparse, datetime as dt
-from typing import Dict, Tuple
+from typing import Dict, Tuple, List, Any
+import threading
+from copy import deepcopy
 
 import numpy as np
 import pandas as pd
@@ -17,16 +16,21 @@ from dotenv import load_dotenv
 from loguru import logger
 import MetaTrader5 as mt5
 
-# Load env for TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
+# Load env for API keys, Telegram tokens, etc.
 load_dotenv()
 
 from ..utils.config import load_config
-from ..features.technical import rsi, macd, realized_vol, atr
-from ..features.news_fetcher import NewsFetcher
-from ..features.alpha_vantage_fetcher import AlphaVantageFetcher
-from ..features.fundamental import get_economic_calendar
-from ..features.sentiment import FinBertSentiment, hawk_dove_score, aggregate_currency_sentiment
 from ..utils.trade_logger import TradeLogger
+from ..features.technical import rsi, macd, realized_vol, atr
+from ..features import fundamental, alpha_vantage_fetcher
+
+# ================= Globals for Background Data & Threading =================
+shared_data_lock = threading.Lock()
+shared_data = {
+    "news_sentiment": {},
+    "economic_events": [],
+    "last_updated": None
+}
 
 # ================= Default tunables (used as fallbacks; overridden by config inside main) =================
 DRY_RUN        = False
@@ -36,7 +40,7 @@ MIN_HOLD_MIN   = 15
 COOLDOWN_MIN   = 10
 REQUIRE_CONSENSUS = False
 SKIP_IF_MINLOTS_EXCEEDS_RISK = True
-RISK_TOLERANCE_MULTIPLIER = 1.10   # small cushion to avoid near-miss skips
+RISK_TOLERANCE_MULTIPLIER = 1.10
 MAGIC_NUMBER   = 202501
 
 # ================= Time helpers =================
@@ -54,6 +58,39 @@ def within_trading_window(cfg: dict) -> bool:
     hour = now_utc().hour
     return w["start_hour_utc"] <= hour < w["end_hour_utc"]
 
+# ================= Background Data Fetching =================
+def background_data_updater(cfg: dict, symbols: list[str]):
+    """
+    Runs in a background thread to periodically fetch news and economic data
+    without blocking the main trading loop.
+    """
+    global shared_data
+
+    av_api_key = os.getenv(cfg.get("alpha_vantage_api_key_env"))
+    news_provider = cfg.get("news_provider", "alphavantage" if av_api_key else None)
+
+    while True:
+        try:
+            logger.info("BACKGROUND: Fetching news and economic data...")
+            sentiments = {}
+            if news_provider == "alphavantage":
+                sentiments = alpha_vantage_fetcher.fetch_news_sentiments(api_key=av_api_key, symbols=symbols)
+
+            events = fundamental.get_economic_calendar()
+
+            with shared_data_lock:
+                shared_data["news_sentiment"] = sentiments
+                shared_data["economic_events"] = events
+                shared_data["last_updated"] = now_utc()
+
+            logger.info("BACKGROUND: Data updated successfully.")
+
+        except Exception as e:
+            logger.exception(f"BACKGROUND: Data fetch failed: {e}")
+
+        # Update every 15 minutes
+        time.sleep(15 * 60)
+
 # ================= MT5 data =================
 TF_MAP = {
     "M5":  mt5.TIMEFRAME_M5,
@@ -70,127 +107,82 @@ def fetch_bars(symbol: str, tf_code, count: int = 600) -> pd.DataFrame:
     return df.rename(columns={"open":"open","high":"high","low":"low","close":"close"}) \
              .set_index("time")[["open","high","low","close"]]
 
-# ================= Features & signal =================
+# ================= Features & Signal Generation =================
 def build_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-
-    # Core indicators
     out["rsi14"] = rsi(out["close"], 14)
     m = macd(out["close"])
     out = out.join(m)
     out["rv96"] = realized_vol(out["close"], 96)
     out["atr14"] = atr(out, 14)
-
-    # Trend filter for symmetry (more shorts when trend/momentum are down)
     out["ema50"]  = out["close"].ewm(span=50, adjust=False).mean()
     out["ema200"] = out["close"].ewm(span=200, adjust=False).mean()
-
     out.dropna(inplace=True)
     return out
 
 def prob_up_from_feats(feats: pd.DataFrame) -> float:
-    """
-    Symmetric logit over trend/momentum/RSI:
-      - trend_term  > 0 (ema50 > ema200) pushes up; < 0 pushes down
-      - macd_term   normalized by RV (stable across regimes)
-      - rsi_term    above 50 is bearish weight, below 50 bullish weight
-    """
     den = float(feats["rv96"].iloc[-1]) + 1e-9
-
     macd_norm  = float(feats["macd_hist"].iloc[-1]) / den
     trend_norm = float(feats["ema50"].iloc[-1] - feats["ema200"].iloc[-1]) / den
-
-    macd_term  = np.tanh(2.0 * macd_norm)      # [-1..1]
-    trend_term = np.tanh(1.2 * trend_norm)     # [-1..1]
-
+    macd_term  = np.tanh(2.0 * macd_norm)
+    trend_term = np.tanh(1.2 * trend_norm)
     rsi_dist   = (float(feats["rsi14"].iloc[-1]) - 50.0) / 20.0
     rsi_term   = np.clip(rsi_dist, -2.0, 2.0)
-
     logit = (0.8 * trend_term) + (0.6 * macd_term) - (0.6 * rsi_term)
-
-    price  = float(feats["close"].iloc[-1])
-    ema50  = float(feats["ema50"].iloc[-1])
-    ema200 = float(feats["ema200"].iloc[-1])
-    if price < min(ema50, ema200):
-        logit -= 0.10
-    elif price > max(ema50, ema200):
-        logit += 0.10
-
-    p_up = float(1.0 / (1.0 + np.exp(-logit)))
-    return p_up
+    price, ema50, ema200 = float(feats["close"].iloc[-1]), float(feats["ema50"].iloc[-1]), float(feats["ema200"].iloc[-1])
+    if price < min(ema50, ema200): logit -= 0.10
+    elif price > max(ema50, ema200): logit += 0.10
+    return float(1.0 / (1.0 + np.exp(-logit)))
 
 def get_final_trade_decision(
-    p_up_tech: float,
+    p_up_technical: float,
     symbol: str,
-    sentiment: Dict[str, float],
-    events: pd.DataFrame,
-    event_lookahead_min: int = 45,
-    sentiment_strength_factor: float = 0.2,
-) -> Tuple[float, bool, dict]:
+    current_sentiment: dict,
+    current_events: list
+) -> Tuple[float, str]:
     """
-    Combines technical, sentiment, and fundamental signals into a final decision.
-    Returns the final probability, a trade_allowed flag, and a dictionary of features for logging.
+    Combines technical probability with sentiment and economic events.
+    - Blocks trades if a high-impact event is imminent.
+    - Adjusts probability based on news sentiment.
     """
-    base_curr, quote_curr = symbol[:3], symbol[3:]
-    features = {}
+    # 1. Check for blocking economic events
+    now = now_utc()
+    event_window_seconds = 3600  # Block trades 1h before a high-impact event
+    for event in current_events:
+        event_time = event.get('datetime_utc')
+        if event.get('impact') == 'High' and event_time:
+            time_diff_seconds = (event_time - now).total_seconds()
+            # Block if event is in the next hour or happened in the last 15 mins
+            if -900 < time_diff_seconds < event_window_seconds:
+                reason = f"BLOCK: High-impact event '{event.get('event')}' at {event_time.strftime('%H:%M')} UTC"
+                return 0.5, reason # Return neutral prob to prevent trade
 
-    # 1. Sentiment Adjustment
-    base_sentiment = sentiment.get(base_curr, 0.0)
-    quote_sentiment = sentiment.get(quote_curr, 0.0)
-    net_sentiment = base_sentiment - quote_sentiment
-    sentiment_adjustment = net_sentiment * sentiment_strength_factor
-    p_up_adjusted = p_up_tech + sentiment_adjustment
-    p_up_adjusted = np.clip(p_up_adjusted, 0.0, 1.0)
+    # 2. Adjust based on sentiment
+    final_p_up = p_up_technical
+    symbol_sentiment = current_sentiment.get(symbol)
+    if symbol_sentiment and symbol_sentiment.get("relevance_sum", 0) > 0.5: # Require some relevance
+        # Map sentiment score [-1, 1] to a sentiment probability [0, 1]
+        sentiment_score = symbol_sentiment.get('sentiment_score', 0.0)
+        sentiment_p_up = 0.5 + (sentiment_score / 2.0)
 
-    features.update({
-        'technical_p_up': p_up_tech,
-        'final_p_up': p_up_adjusted,
-        'base_sentiment': base_sentiment,
-        'quote_sentiment': quote_sentiment,
-        'net_sentiment': net_sentiment,
-    })
+        # Weighted average: 70% technical, 30% sentiment
+        final_p_up = (0.7 * p_up_technical) + (0.3 * sentiment_p_up)
+        reason = f"Tech({p_up_technical:.2f}) + Sent({sentiment_p_up:.2f})"
+    else:
+        reason = f"Tech({p_up_technical:.2f}) only"
 
-    # 2. Fundamental Event Check
-    trade_allowed = True
-    if not events.empty:
-        now = pd.Timestamp.utcnow()
-        for _, event in events.iterrows():
-            event_time_str = event.get('time', '')
-            if event_time_str and event_time_str.lower() != 'all day':
-                try:
-                    event_date_str = event.get('date', '')
-                    if event_time_str and event_date_str and event_time_str.lower() != 'all day':
-                        event_dt = pd.to_datetime(f"{event_date_str} {event_time_str}", format='%d/%m/%Y %H:%M', utc=True)
-                        time_to_event_min = (event_dt - now).total_seconds() / 60.0
-
-                        if 0 < time_to_event_min < event_lookahead_min:
-                            event_curr = event.get('currency', '').upper()
-                            if event_curr in [base_curr, quote_curr]:
-                                logger.warning(f"[{symbol}] Blocking trade due to upcoming high-impact event: {event['event']} for {event_curr} in {time_to_event_min:.1f} minutes.")
-                                trade_allowed = False
-                                break
-                except (ValueError, TypeError) as e:
-                    logger.warning(f"Could not parse event date/time for event: {event.get('event')}. Error: {e}")
-                    continue
-
-    if p_up_adjusted != p_up_tech:
-        logger.info(f"[{symbol}] Sentiment adjusted p_up: {p_up_tech:.2f} -> {p_up_adjusted:.2f} (net_sentiment={net_sentiment:.2f})")
-
-    return p_up_adjusted, trade_allowed, features
+    return final_p_up, reason
 
 # ================= Account / execution =================
 def account_equity() -> float:
     acc = mt5.account_info()
-    if not acc:
-        raise RuntimeError(f"account_info() failed: {mt5.last_error()}")
+    if not acc: raise RuntimeError(f"account_info() failed: {mt5.last_error()}")
     return float(acc.equity)
 
 def symbol_info_or_raise(symbol: str):
     info = mt5.symbol_info(symbol)
-    if info is None:
-        raise RuntimeError(f"symbol_info({symbol}) failed")
-    if not info.visible:
-        mt5.symbol_select(symbol, True)
+    if info is None: raise RuntimeError(f"symbol_info({symbol}) failed")
+    if not info.visible: mt5.symbol_select(symbol, True)
     return info
 
 def close_symbol_positions(symbol: str) -> dict:
@@ -198,118 +190,75 @@ def close_symbol_positions(symbol: str) -> dict:
     if positions is None:
         logger.error(f"positions_get({symbol}) failed: {mt5.last_error()}")
         return {"ok": False, "msg": str(mt5.last_error()), "closed_tickets": []}
-    if len(positions) == 0:
-        return {"ok": True, "msg": "no positions", "closed_tickets": []}
+    if not positions: return {"ok": True, "msg": "no positions", "closed_tickets": []}
 
     tick = mt5.symbol_info_tick(symbol)
-    results = []
-    closed_tickets = [pos.ticket for pos in positions]
-
+    results, closed_tickets = [], [pos.ticket for pos in positions]
     for pos in positions:
-        lot = pos.volume
         deal_type = mt5.ORDER_TYPE_SELL if pos.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
         price = tick.bid if deal_type == mt5.ORDER_TYPE_SELL else tick.ask
         req = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": lot,
-            "type": deal_type,
-            "position": pos.ticket,
-            "price": price,
-            "deviation": 20,
-            "magic": MAGIC_NUMBER,
-            "comment": "close_by_python",
-            "type_filling": mt5.ORDER_FILLING_FOK,
+            "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": pos.volume,
+            "type": deal_type, "position": pos.ticket, "price": price, "deviation": 20,
+            "magic": MAGIC_NUMBER, "comment": "close_by_python", "type_filling": mt5.ORDER_FILLING_FOK,
         }
         r = mt5.order_send(req)
         results.append(f"{pos.ticket}:{r.retcode}")
     return {"ok": True, "msg": ";".join(results), "closed_tickets": closed_tickets}
 
 def calc_sl_tp(side: int, price: float, atr_val: float, sl_mult: float, tp_mult: float) -> Tuple[float, float]:
-    """
-    ATR-based SL/TP anchored to 'price' (entry tick).
-      - LONG:  SL = price - sl_mult*ATR, TP = price + tp_mult*ATR
-      - SHORT: SL = price + sl_mult*ATR, TP = price - tp_mult*ATR
-    """
-    atr_val = float(atr_val or 0.0)
-    if atr_val <= 0:
-        point = 0.0001
-        return (price - point, price + point) if side > 0 else (price + point, price - point)
-    if side > 0:
-        return float(price - sl_mult * atr_val), float(price + tp_mult * atr_val)
-    else:
-        return float(price + sl_mult * atr_val), float(price - tp_mult * atr_val)
+    if not atr_val or atr_val <= 0: atr_val = 0.0001
+    return (price - sl_mult * atr_val, price + tp_mult * atr_val) if side > 0 else (price + sl_mult * atr_val, price - tp_mult * atr_val)
 
 def enforce_min_distance(symbol: str, side: int, entry: float, sl: float, tp: float) -> Tuple[float, float]:
     info = symbol_info_or_raise(symbol)
-    point = float(getattr(info, "point", 0.0) or 0.0)
-    stops_level = float(getattr(info, "stops_level", 0) or 0) * point
-    freeze_level = float(getattr(info, "freeze_level", 0) or 0) * point
-    min_dist = max(stops_level, freeze_level, 0.0)
-    if min_dist <= 0 or point <= 0:
-        return sl, tp
+    point = info.point
+    min_dist = info.stops_level * point
+    if min_dist <= 0: return sl, tp
     if side > 0:
         sl = min(sl, entry - min_dist)
         tp = max(tp, entry + min_dist)
     else:
         sl = max(sl, entry + min_dist)
         tp = min(tp, entry - min_dist)
-    # snap to grid
-    sl = round(sl / point) * point
-    tp = round(tp / point) * point
-    return sl, tp
+    return round(sl / point) * point, round(tp / point) * point
 
 def place_market_order(symbol: str, side: int, lots: float, sl: float | None=None, tp: float | None=None) -> dict:
     info = symbol_info_or_raise(symbol)
     tick = mt5.symbol_info_tick(symbol)
     order_type = mt5.ORDER_TYPE_BUY if side > 0 else mt5.ORDER_TYPE_SELL
     price = tick.ask if side > 0 else tick.bid
-
-    point = float(getattr(info, "point", 0.0) or 0.0)
+    point = info.point
     if point > 0:
-        if sl is not None: sl = round(sl / point) * point
-        if tp is not None: tp = round(tp / point) * point
+        if sl: sl = round(sl / point) * point
+        if tp: tp = round(tp / point) * point
 
     req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": float(lots),
-        "type": order_type,
-        "price": price,
-        "deviation": 20,
-        "magic": MAGIC_NUMBER,
-        "comment": "python_entry",
+        "action": mt5.TRADE_ACTION_DEAL, "symbol": symbol, "volume": float(lots), "type": order_type,
+        "price": price, "deviation": 20, "magic": MAGIC_NUMBER, "comment": "python_entry",
         "type_filling": mt5.ORDER_FILLING_FOK,
     }
-    if sl is not None: req["sl"] = sl
-    if tp is not None: req["tp"] = tp
+    if sl: req["sl"] = sl
+    if tp: req["tp"] = tp
 
-    if DRY_RUN:
-        return {"ok": True, "retcode": "DRY", "comment": "simulated"}
+    if DRY_RUN: return {"ok": True, "retcode": "DRY", "comment": "simulated"}
 
     result = mt5.order_send(req)
-    return {
-        "ok": result.retcode == mt5.TRADE_RETCODE_DONE,
-        "retcode": result.retcode,
-        "comment": result.comment,
-        "deal_id": result.deal if result else None
-    }
+    if result.retcode == mt5.TRADE_RETCODE_DONE:
+        return {"ok": True, "retcode": result.retcode, "comment": result.comment, "deal_id": result.deal}
+    return {"ok": False, "retcode": result.retcode, "comment": result.comment}
 
 # ---------- Telegram: DAILY SUMMARY ONLY ----------
 def _tg_creds(cfg):
     a = cfg.get("alerts", {}) or {}
-    if not a.get("telegram_enabled", False):
-        return None, None
+    if not a.get("telegram_enabled", False): return None, None
     token = os.getenv(a.get("telegram_bot_token_env", ""))
     chat_id = os.getenv(a.get("telegram_chat_id_env", ""))
-    if not token or not chat_id:
-        return None, None
-    return token, chat_id
+    return (token, chat_id) if token and chat_id else (None, None)
 
 def send_telegram_alert(cfg: dict, text: str) -> bool:
     token, chat_id = _tg_creds(cfg)
-    if not token or not chat_id:
-        return False
+    if not token: return False
     try:
         r = requests.get(
             f"https://api.telegram.org/bot{token}/sendMessage",
@@ -317,224 +266,80 @@ def send_telegram_alert(cfg: dict, text: str) -> bool:
             timeout=10,
         )
         return r.ok
-    except Exception:
-        return False
+    except Exception: return False
 
 def human_pl(v: float) -> str:
-    sign = "🟢" if v >= 0 else "🔴"
-    return f"{sign} ${abs(v):.2f}"
+    return f"{'🟢' if v >= 0 else '🔴'} ${abs(v):.2f}"
 
 def build_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, symbols: list[str]) -> dict:
     deals = mt5.history_deals_get(start_ts, end_ts) or []
-    total = 0.0
-    wins = 0
-    trades = 0
-    per_symbol: Dict[str, float] = {s: 0.0 for s in symbols}
-
+    summary = {"total": 0.0, "trades": 0, "wins": 0, "per_symbol": {s: 0.0 for s in symbols}}
     for d in deals:
-        try:
-            if getattr(d, "entry", None) != mt5.DEAL_ENTRY_OUT:
-                continue
-            sym = getattr(d, "symbol", "")
-            if sym not in per_symbol:
-                continue
-            p  = float(getattr(d, "profit", 0.0) or 0.0)
-            c  = float(getattr(d, "commission", 0.0) or 0.0)
-            sw = float(getattr(d, "swap", 0.0) or 0.0)
-            net = p + c + sw
-            total += net
-            per_symbol[sym] += net
-            trades += 1
-            if net > 0:
-                wins += 1
-        except Exception:
-            continue
-
-    winrate = (wins / trades * 100.0) if trades else 0.0
-    return {"total": total, "trades": trades, "wins": wins, "winrate": winrate, "per_symbol": per_symbol}
+        if d.entry != mt5.DEAL_ENTRY_OUT or d.symbol not in summary["per_symbol"]: continue
+        net = d.profit + d.commission + d.swap
+        summary["total"] += net
+        summary["per_symbol"][d.symbol] += net
+        summary["trades"] += 1
+        if net > 0: summary["wins"] += 1
+    summary["winrate"] = (summary["wins"] / summary["trades"] * 100.0) if summary["trades"] else 0.0
+    return summary
 
 def format_daily_summary(start_ts: dt.datetime, end_ts: dt.datetime, sym_summary: dict) -> str:
-    lines = []
-    lines.append("<b>📊 Daily Summary</b>")
-    lines.append(f"<b>Period:</b> {start_ts:%Y-%m-%d %H:%M} → {end_ts:%Y-%m-%d %H:%M} UTC")
-    lines.append(f"<b>Trades:</b> {sym_summary['trades']}   <b>Win rate:</b> {sym_summary['winrate']:.0f}%")
-    lines.append(f"<b>Net P/L:</b> {human_pl(sym_summary['total'])}")
-    lines.append("<b>By symbol:</b>")
-    for s, v in sym_summary["per_symbol"].items():
-        lines.append(f"• {s}: {human_pl(v)}")
+    lines = [
+        "<b>📊 Daily Summary</b>",
+        f"<b>Period:</b> {start_ts:%Y-%m-%d %H:%M} → {end_ts:%Y-%m-%d %H:%M} UTC",
+        f"<b>Trades:</b> {sym_summary['trades']}   <b>Win rate:</b> {sym_summary['winrate']:.0f}%",
+        f"<b>Net P/L:</b> {human_pl(sym_summary['total'])}", "<b>By symbol:</b>"
+    ] + [f"• {s}: {human_pl(v)}" for s, v in sym_summary["per_symbol"].items()]
     return "\n".join(lines)
 
 def format_trade_close_alert(deal: mt5.TradeDeal) -> str:
-    """Formats a message for a single closed trade."""
-    side_closed = "BUY" if deal.type == mt5.DEAL_TYPE_SELL else "SELL"
     pnl = deal.profit + deal.commission + deal.swap
-
-    lines = []
-    lines.append(f"<b>🔔 Trade Closed: {deal.symbol}</b>")
-    lines.append(f"<b>Direction:</b> {side_closed}")
-    lines.append(f"<b>Profit/Loss:</b> {human_pl(pnl)}")
-    lines.append(f"<b>Volume:</b> {deal.volume:.2f}")
-    lines.append(f"<b>Close Price:</b> {deal.price:.5f}")
-
-    return "\n".join(lines)
+    return "\n".join([
+        f"<b>🔔 Trade Closed: {deal.symbol}</b>",
+        f"<b>Direction:</b> {'BUY' if deal.type == mt5.DEAL_TYPE_SELL else 'SELL'}",
+        f"<b>Profit/Loss:</b> {human_pl(pnl)}",
+        f"<b>Volume:</b> {deal.volume:.2f}",
+        f"<b>Close Price:</b> {deal.price:.5f}",
+    ])
 
 # ================= Robust lot sizing (FX-friendly) =================
 def first_non_none(*vals):
-    for v in vals:
-        if v is not None:
-            return v
-    return None
+    return next((v for v in vals if v is not None), None)
 
 def risk_dollars_from_bps(equity: float, bps: float) -> float:
     return equity * (bps / 10_000.0)
 
 def clamp_to_step(x: float, step: float, min_v: float, max_v: float) -> float:
-    if step <= 0:
-        step = 0.01
-    x = max(min_v, min(max_v, x))
-    steps = round(x / step)
-    return round(steps * step, 3)
+    if step <= 0: step = 0.01
+    return round(max(min_v, min(max_v, x)) / step) * step
 
 def lots_for_risk(symbol: str, equity: float, stop_distance_price: float, bps: float) -> float:
     info = symbol_info_or_raise(symbol)
+    tick_size = first_non_none(info.trade_tick_size, info.tick_size, info.point)
+    tick_value = first_non_none(info.trade_tick_value, info.tick_value, (info.point * info.trade_contract_size) or None)
+    vol_min, vol_step, vol_max = info.volume_min, info.volume_step, info.volume_max
 
-    tick_size = first_non_none(
-        getattr(info, "trade_tick_size", None),
-        getattr(info, "tick_size", None),
-        getattr(info, "point", None),
-    )
-    tick_value = first_non_none(
-        getattr(info, "trade_tick_value", None),
-        getattr(info, "tick_value", None),
-        getattr(info, "trade_tick_value_profit", None),
-        getattr(info, "trade_tick_value_loss", None),
-        (getattr(info, "point", 0.0) * getattr(info, "trade_contract_size", 0.0)) or None,
-    )
-
-    vol_min  = float(getattr(info, "volume_min", 0.01) or 0.01)
-    vol_step = float(getattr(info, "volume_step", 0.01) or 0.01)
-    vol_max  = float(getattr(info, "volume_max", 100.0) or 100.0)
-
-    if not tick_size or not tick_value or stop_distance_price <= 0:
-        logger.warning(f"[{symbol}] sizing fallback — tick_size={tick_size}, tick_value={tick_value}, stop={stop_distance_price}")
+    if not all([tick_size, tick_value, stop_distance_price > 0]):
         return clamp_to_step(0.01, vol_step, vol_min, vol_max)
 
-    risk_per_lot = (stop_distance_price / float(tick_size)) * float(tick_value)
-    risk_target  = risk_dollars_from_bps(equity, bps)
-    if risk_per_lot <= 0:
-        logger.warning(f"[{symbol}] risk_per_lot<=0 fallback; tick_size={tick_size}, tick_value={tick_value}")
-        return clamp_to_step(0.01, vol_step, vol_min, vol_max)
+    risk_per_lot = (stop_distance_price / tick_size) * tick_value
+    if risk_per_lot <= 0: return clamp_to_step(0.01, vol_step, vol_min, vol_max)
 
+    risk_target = risk_dollars_from_bps(equity, bps)
     lots_raw = risk_target / risk_per_lot
     lots = clamp_to_step(lots_raw, vol_step, vol_min, vol_max)
-
-    logger.info(f"[{symbol}] risk size: tick_size={tick_size} tick_value={tick_value} stop={stop_distance_price:.6f} "
-                f"risk_per_lot=${risk_per_lot:.2f} target=${risk_target:.2f} → lots={lots}")
+    logger.info(f"[{symbol}] Sizing: stop_dist={stop_distance_price:.5f}, risk_per_lot=${risk_per_lot:.2f}, target=${risk_target:.2f} -> lots={lots}")
     return lots
 
 def estimate_risk_dollars(symbol: str, lots: float, stop_distance_price: float) -> float:
     info = symbol_info_or_raise(symbol)
-    tick_size = first_non_none(
-        getattr(info, "trade_tick_size", None),
-        getattr(info, "tick_size", None),
-        getattr(info, "point", None),
-    )
-    tick_value = first_non_none(
-        getattr(info, "trade_tick_value", None),
-        getattr(info, "tick_value", None),
-        getattr(info, "trade_tick_value_profit", None),
-        getattr(info, "trade_tick_value_loss", None),
-        (getattr(info, "point", 0.0) * getattr(info, "trade_contract_size", 0.0)) or None,
-    )
-    if not tick_size or not tick_value or stop_distance_price <= 0:
-        return float("inf")
-    risk_per_lot = (stop_distance_price / float(tick_size)) * float(tick_value)
-    return float(risk_per_lot) * float(lots)
+    tick_size = first_non_none(info.trade_tick_size, info.tick_size, info.point)
+    tick_value = first_non_none(info.trade_tick_value, info.tick_value, (info.point * info.trade_contract_size) or None)
+    if not all([tick_size, tick_value, stop_distance_price > 0]): return float("inf")
+    return (stop_distance_price / tick_size) * tick_value * lots
 
-def external_data_worker(
-    stop_event: threading.Event,
-    shared_data: dict,
-    lock: threading.Lock,
-    cfg: dict,
-    all_currencies: list[str],
-):
-    """
-    A worker function that runs in a background thread to fetch news and calendar data.
-    """
-    logger.info("Background data worker started.")
-
-    # Unpack config for this thread
-    news_cfg = cfg.get("news", {})
-    news_enabled = news_cfg.get("enabled", False)
-    news_provider = news_cfg.get("provider", "newsapi")
-    news_fetcher = shared_data.get("news_fetcher")
-    sentiment_analyzer = shared_data.get("sentiment_analyzer")
-    news_keywords = news_cfg.get("keywords", [])
-    news_sources = news_cfg.get("sources", [])
-    news_topics = news_cfg.get("topics", ["forex", "economy_monetary"])
-
-    fundamental_cfg = cfg.get("fundamental", {})
-    fundamental_enabled = fundamental_cfg.get("enabled", True)
-    calendar_importances = fundamental_cfg.get("importances", ["high"])
-
-    news_interval_sec = 30 * 60
-    calendar_interval_sec = 60 * 60
-    last_news_fetch_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-    last_calendar_fetch_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-
-    while not stop_event.is_set():
-        now = now_utc()
-
-        # --- Fetch News & Sentiment periodically ---
-        if news_enabled and news_fetcher and (now - last_news_fetch_time).total_seconds() >= news_interval_sec:
-            logger.info(f"[BG] Fetching news from provider: {news_provider}...")
-            try:
-                articles = []
-                if news_provider == 'alphavantage':
-                    av_tickers = [f"FOREX:{c}" for c in all_currencies]
-                    articles = news_fetcher.fetch_forex_news(topics=news_topics, tickers=av_tickers)
-                elif news_provider == 'newsapi':
-                    articles = news_fetcher.fetch_forex_news(keywords=news_keywords, sources=news_sources)
-                    if articles:
-                        for art in articles:
-                            art['timestamp'] = dt.datetime.fromisoformat(art['publishedAt'].replace('Z', '+00:00'))
-                            art['currencies'] = [c for c in all_currencies if c.lower() in (art.get('title','').lower() or '') or c.lower() in (art.get('description','').lower() or '')]
-                            art['sentiment'] = sentiment_analyzer.score(art.get('title','') + " " + art.get('description',''))
-
-                if articles:
-                    sentiment_data = aggregate_currency_sentiment(articles)
-                    with lock:
-                        shared_data['currency_sentiment'] = sentiment_data
-                        shared_data['last_sentiment_update'] = now
-                    logger.info(f"[BG] Updated currency sentiment: {sentiment_data}")
-
-            except Exception as e:
-                logger.exception(f"[BG] Error during news fetch/sentiment analysis: {e}")
-            last_news_fetch_time = now
-
-        # --- Fetch Economic Calendar periodically ---
-        if fundamental_enabled and (now - last_calendar_fetch_time).total_seconds() >= calendar_interval_sec:
-            logger.info("[BG] Fetching economic calendar...")
-            try:
-                events = get_economic_calendar(all_currencies, calendar_importances)
-                with lock:
-                    shared_data['upcoming_events'] = events
-                    shared_data['last_calendar_update'] = now
-                if not events.empty:
-                    logger.info(f"[BG] Found {len(events)} upcoming economic events.")
-            except Exception as e:
-                logger.exception(f"[BG] Error during economic calendar fetch: {e}")
-            last_calendar_fetch_time = now
-
-        stop_event.wait(60) # Check for stop signal every minute
-
-    logger.info("Background data worker stopped.")
-
-
-# ================= Main =================
-import threading
-import copy
-
+# ================= Main Execution Logic =================
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", default=None, help="Comma-separated override (e.g., EURUSD,GBPUSD)")
@@ -543,409 +348,231 @@ def main():
     cfg = load_config()
     symbols = (args.symbols.split(",") if args.symbols else cfg.get("symbols", []))
     tfs = cfg.get("timeframes", ["M5"])
-    assert all(tf in TF_MAP for tf in tfs), f"Unsupported TF in config; allowed {list(TF_MAP)}"
     tf_codes = {tf: TF_MAP[tf] for tf in tfs}
 
-    # --- Strategy knobs from config (safe locals; do not mutate globals) ---
-    def _as_float(v, d): 
-        try: return float(v)
-        except (TypeError, ValueError): return d
-    def _as_int(v, d): 
-        try: return int(v)
-        except (TypeError, ValueError): return d
+    strat = cfg.get("strategy") or {}
+    enter_thresh, exit_thresh = strat.get("enter_thresh", ENTER_THRESH), strat.get("exit_thresh", EXIT_THRESH)
+    min_hold_min, cooldown_min = strat.get("min_hold_min", MIN_HOLD_MIN), strat.get("cooldown_min", COOLDOWN_MIN)
+    require_entry_confirmation = strat.get("require_entry_confirmation", False)
 
-    strat = (cfg.get("strategy") or {})
-    enter_thresh = _as_float(strat.get("enter_thresh"), ENTER_THRESH)
-    exit_thresh  = _as_float(strat.get("exit_thresh"),  EXIT_THRESH)
-    min_hold_min = _as_int  (strat.get("min_hold_min"), MIN_HOLD_MIN)
-    cooldown_min = _as_int  (strat.get("cooldown_min"), COOLDOWN_MIN)
-
-    # --- Risk config ---
     risk_cfg = cfg["risk"]
-    sl_mult  = float(risk_cfg.get("stop_atr_mult", 2.0))
-    tp_mult  = float(risk_cfg.get("takeprofit_atr_mult", 3.0))
-    if tp_mult <= sl_mult:
-        logger.warning(f"takeprofit_atr_mult ({tp_mult}) <= stop_atr_mult ({sl_mult}); prefer RR > 1")
-    trade_bps = float(risk_cfg.get("max_risk_per_trade_bps", 80.0))  # 0.8% default
-    kill = risk_cfg.get("kill_switch", {}) or {}
-    daily_dd_max   = float(kill.get("max_intraday_drawdown_pct", 4.0))
-    max_trades_day = int(kill.get("max_daily_trades_per_symbol", 6))
+    sl_mult, tp_mult = risk_cfg.get("stop_atr_mult", 2.0), risk_cfg.get("takeprofit_atr_mult", 3.0)
+    trade_bps = risk_cfg.get("max_risk_per_trade_bps", 80.0)
+    kill = risk_cfg.get("kill_switch", {})
+    daily_dd_max, max_trades_day = kill.get("max_intraday_drawdown_pct", 4.0), kill.get("max_daily_trades_per_symbol", 6)
 
-    # --- Initialize News and Sentiment Fetchers ---
-    news_cfg = cfg.get("news", {})
-    news_enabled = news_cfg.get("enabled", False)
-    news_provider = news_cfg.get("provider", "newsapi")
-    news_fetcher = None
-    sentiment_analyzer = None
-
-    if news_enabled:
-        if news_provider == "alphavantage":
-            api_key = os.getenv(news_cfg.get("alpha_vantage_api_key_env", "ALPHA_VANTAGE_API_KEY"))
-            if not api_key:
-                logger.warning("News provider is 'alphavantage' but ALPHA_VANTAGE_API_KEY is not set. Disabling news.")
-                news_enabled = False
-            else:
-                news_fetcher = AlphaVantageFetcher(api_key=api_key)
-        elif news_provider == "newsapi":
-            api_key = os.getenv(news_cfg.get("news_api_key_env", "NEWS_API_KEY"))
-            if not api_key:
-                logger.warning("News provider is 'newsapi' but NEWS_API_KEY is not set. Disabling news.")
-                news_enabled = False
-            else:
-                try:
-                    news_fetcher = NewsFetcher(api_key=api_key)
-                    sentiment_analyzer = FinBertSentiment()
-                except Exception as e:
-                    logger.exception(f"Failed to initialize FinBERT, disabling news feature: {e}")
-                    news_enabled = False
-
-    all_currencies = list(set([s[:3] for s in symbols] + [s[3:] for s in symbols]))
-
-    # --- Shared data for background thread ---
-    shared_data = {
-        'currency_sentiment': {c: 0.0 for c in all_currencies},
-        'upcoming_events': pd.DataFrame(),
-        'last_sentiment_update': dt.datetime.min.replace(tzinfo=dt.timezone.utc),
-        'last_calendar_update': dt.datetime.min.replace(tzinfo=dt.timezone.utc),
-        'news_fetcher': news_fetcher,
-        'sentiment_analyzer': sentiment_analyzer,
-    }
-    data_lock = threading.Lock()
-    stop_event = threading.Event()
-
-    # --- Start background data worker ---
-    worker_thread = threading.Thread(
-        target=external_data_worker,
-        args=(stop_event, shared_data, data_lock, cfg, all_currencies),
-        daemon=True
-    )
-    worker_thread.start()
-
-
-    if not mt5.initialize():
-        raise RuntimeError(f"MetaTrader5 initialize() failed: {mt5.last_error()}")
-    logger.info(f"MT5 initialized. Symbols={symbols} TFs={tfs}")
+    if not mt5.initialize(): raise RuntimeError(f"MT5 init failed: {mt5.last_error()}")
+    logger.info(f"MT5 initialized. Symbols={symbols}, TFs={tfs}")
 
     # ---- State ----
-    last_bar_time: Dict[str, Dict[str, pd.Timestamp]] = {s: {tf: pd.Timestamp(0, tz="UTC") for tf in tfs} for s in symbols}
-    tf_side: Dict[str, Dict[str, int]] = {s: {tf: 0 for tf in tfs} for s in symbols}
-    open_side: Dict[str, int] = {s: 0 for s in symbols}
-    waiting_for_confirmation: Dict[str, int] = {s: 0 for s in symbols}
-    trades_today: Dict[str, int] = {s: 0 for s in symbols}
-    last_open_time: Dict[str, dt.datetime]  = {s: dt.datetime.min.replace(tzinfo=dt.timezone.utc) for s in symbols}
-    last_close_time: Dict[str, dt.datetime] = {s: dt.datetime.min.replace(tzinfo=dt.timezone.utc) for s in symbols}
+    last_bar_time = {s: {tf: pd.Timestamp(0, tz="UTC") for tf in tfs} for s in symbols}
+    tf_side = {s: {tf: 0 for tf in tfs} for s in symbols}
+    open_side = {s: 0 for s in symbols}
+    trades_today = {s: 0 for s in symbols}
+    last_open_time = {s: now_utc() - dt.timedelta(days=99) for s in symbols}
+    last_close_time = {s: now_utc() - dt.timedelta(days=99) for s in symbols}
     pending_alerts = set()
+    pending_signal: Dict[str, Dict[str, Any]] = {} # For entry confirmation feature
     trade_logger = TradeLogger()
 
-    # --- Sync with any live positions in MT5 ---
-    positions = mt5.positions_get()
-    if positions:
-        for p in positions:
-            if p.symbol not in symbols:
-                continue
-            side = +1 if p.type == mt5.POSITION_TYPE_BUY else -1
-            open_side[p.symbol] = side
-            if getattr(p, "time", None):
-                t_open = dt.datetime.fromtimestamp(p.time, tz=dt.timezone.utc)
-                last_open_time[p.symbol] = t_open
-            logger.info(
-                f"{p.symbol}: detected {'LONG' if side>0 else 'SHORT'} {p.volume:.2f} lots "
-                f"@ {p.price_open:.5f} (since {last_open_time[p.symbol]})"
-            )
+    for p in mt5.positions_get() or []:
+        if p.symbol in symbols:
+            open_side[p.symbol] = +1 if p.type == mt5.POSITION_TYPE_BUY else -1
+            last_open_time[p.symbol] = dt.datetime.fromtimestamp(p.time, tz=dt.timezone.utc)
+            logger.info(f"Detected live {p.symbol} {'LONG' if open_side[p.symbol]>0 else 'SHORT'} from {last_open_time[p.symbol]}")
 
-    day_start = today_utc_start()
-    equity_day_open = account_equity()
-    paused_for_dd = False
+    day_start, equity_day_open, paused_for_dd = today_utc_start(), account_equity(), False
 
-    logger.info("🟢 Bot started (M5 FX, low-equity safe).")
+    # ---- Start background data thread ----
+    data_thread = threading.Thread(target=background_data_updater, args=(cfg, symbols), daemon=True)
+    data_thread.start()
+    logger.info("Background data fetching thread started. Waiting 10s for initial data...")
+    time.sleep(10)
 
-    try:
-        while True:
-            nowt_loop = now_utc()
+    logger.info("🟢 Bot started.")
 
-            # --- Get latest data from shared state ---
-            with data_lock:
-                local_sentiment = copy.deepcopy(shared_data['currency_sentiment'])
-                local_events = shared_data['upcoming_events'].copy()
-                last_sent_update = shared_data['last_sentiment_update']
-                last_cal_update = shared_data['last_calendar_update']
+    while True:
+        nowt_loop = now_utc()
 
-            logger.debug(f"Using sentiment data from {last_sent_update} ({(nowt_loop - last_sent_update).total_seconds():.0f}s ago)")
-            logger.debug(f"Using calendar data from {last_cal_update} ({(nowt_loop - last_cal_update).total_seconds():.0f}s ago)")
+        if pending_alerts:
+            deals = mt5.history_deals_get(day_start, nowt_loop) or []
+            processed = {d.position_id for d in deals if d.position_id in pending_alerts and d.entry == mt5.DEAL_ENTRY_OUT and (
+                trade_logger.log_close_trade(d.position_id, d.profit + d.commission + d.swap),
+                send_telegram_alert(cfg, format_trade_close_alert(d)) if cfg.get("alerts",{}).get("alert_on_trade_close") else True
+            )}
+            pending_alerts.difference_update(processed)
 
-            # --- Process pending trade close alerts ---
-            if pending_alerts and cfg.get("alerts", {}).get("alert_on_trade_close"):
-                # Fetch deals from the start of the bot run to be safe
-                deals = mt5.history_deals_get(day_start, nowt_loop)
-                if deals:
-                    processed_alerts = set()
-                    for deal in deals:
-                        if deal.position_id in pending_alerts and deal.entry == mt5.DEAL_ENTRY_OUT:
-                            try:
-                                # Log the close event
-                                pnl = deal.profit + deal.commission + deal.swap
-                                trade_logger.log_close_trade(deal.position_id, pnl)
+        if nowt_loop >= day_start + dt.timedelta(days=1):
+            summary = build_daily_summary(day_start, nowt_loop, symbols)
+            send_telegram_alert(cfg, format_daily_summary(day_start, nowt_loop, summary))
+            day_start, equity_day_open = today_utc_start(), account_equity()
+            trades_today, paused_for_dd = {s: 0 for s in symbols}, False
+            logger.info("🔄 New UTC day: counters reset")
 
-                                # Send Telegram alert
-                                msg = format_trade_close_alert(deal)
-                                send_telegram_alert(cfg, msg)
-                                processed_alerts.add(deal.position_id)
-                            except Exception as e:
-                                logger.exception(f"Failed to process trade close event for deal {deal.ticket}: {e}")
+        dd_pct = (account_equity() - equity_day_open) / max(equity_day_open, 1) * 100.0
+        if dd_pct <= -abs(daily_dd_max) and not paused_for_dd:
+            if not DRY_RUN:
+                for s in symbols:
+                    res = close_symbol_positions(s)
+                    if res.get("closed_tickets"): pending_alerts.update(res["closed_tickets"])
+            paused_for_dd = True
+            logger.error(f"⛔ KILL-SWITCH: DD {dd_pct:.2f}% hit. Paused until next day.")
+        if paused_for_dd or not within_trading_window(cfg):
+            time.sleep(60)
+            continue
 
-                    if processed_alerts:
-                        pending_alerts.difference_update(processed_alerts)
+        with shared_data_lock:
+            latest_sentiment = deepcopy(shared_data["news_sentiment"])
+            latest_events = deepcopy(shared_data["economic_events"])
 
+        for s in symbols:
+            # Rate limit check
+            if trades_today[s] >= max_trades_day: continue
 
-            # New day: send summary then reset counters
-            if nowt_loop >= day_start + dt.timedelta(days=1):
-                try:
-                    end_ts = now_utc()
-                    summary = build_daily_summary(day_start, end_ts, symbols)
-                    msg = format_daily_summary(day_start, end_ts, summary)
-                    send_telegram_alert(cfg, msg)
-                except Exception as e:
-                    logger.exception(f"Daily summary failed: {e}")
+            # --- Step 1: Check for and action any pending entry signals ---
+            if s in pending_signal and require_entry_confirmation:
+                primary_tf = tfs[0]
+                df = fetch_bars(s, tf_codes[primary_tf], count=2)
+                if df.empty or df.index[-1] <= pending_signal[s]["bar_time"]:
+                    continue # Wait for a new bar
 
-                day_start = today_utc_start()
-                equity_day_open = account_equity()
-                trades_today = {s: 0 for s in symbols}
-                paused_for_dd = False
-                logger.info("🔄 New UTC day: counters reset")
+                confirming_bar = df.iloc[-2] # The bar that just closed
+                signal_side = pending_signal[s]["side"]
 
-            # Kill-switch
-            eq = account_equity()
-            dd_pct = (eq - equity_day_open) / max(equity_day_open, 1e-9) * 100.0
-            if dd_pct <= -abs(daily_dd_max) and not paused_for_dd:
-                if not DRY_RUN:
-                    for s in symbols:
-                        close_symbol_positions(s)
-                paused_for_dd = True
-                logger.error(f"⛔ Kill-switch: DD {dd_pct:.2f}% ≤ {daily_dd_max}% — flattened & paused")
-            if paused_for_dd:
-                time.sleep(60)
-                continue
+                confirmed = (signal_side > 0 and confirming_bar['close'] > confirming_bar['open']) or \
+                            (signal_side < 0 and confirming_bar['close'] < confirming_bar['open'])
 
-            if not within_trading_window(cfg):
-                time.sleep(10)
-                continue
+                if confirmed:
+                    logger.info(f"[{s}] CONFIRMED pending {'LONG' if signal_side > 0 else 'SHORT'} signal.")
+                    # Pop the signal and proceed to execution
+                    signal_details = pending_signal.pop(s)
+                    # Use the original ATR and features for sizing/logging
+                    atr_use, last_feats = signal_details["atr"], signal_details["feats"]
+                    tech_p_up, final_p_up = signal_details["tech_p_up"], signal_details["final_p_up"]
 
-            for s in symbols:
-                if trades_today[s] >= max_trades_day:
-                    continue
+                    # --- Execute confirmed trade ---
+                    tick = mt5.symbol_info_tick(s)
+                    if not tick: continue
+                    entry_price = tick.ask if signal_side > 0 else tick.bid
+                    sl, tp = calc_sl_tp(signal_side, entry_price, atr_use, sl_mult, tp_mult)
+                    sl, tp = enforce_min_distance(s, signal_side, entry_price, sl, tp)
+                    stop_dist = abs(entry_price - sl)
+                    equity = account_equity()
+                    lots = lots_for_risk(s, equity, stop_dist, trade_bps)
 
-                tf_probs = {}
-                tf_atr   = {}
-                updated_any = False
-
-                for tf in tfs:
-                    df = fetch_bars(s, tf_codes[tf], count=400)  # ~33h on M5
-                    if df.empty or len(df) < 200:
-                        continue
-                    last = df.index[-1]
-                    if last == last_bar_time[s][tf]:
-                        continue
-                    last_bar_time[s][tf] = last
-                    updated_any = True
-
-                    feats = build_features(df.iloc[:-1])  # closed bar only
-                    if feats.empty:
-                        continue
-                    p_tech = prob_up_from_feats(feats)
-
-                    # Get final decision with sentiment and fundamentals
-                    p_final, trade_allowed, features = get_final_trade_decision(
-                        p_tech, s, local_sentiment, local_events
-                    )
-
-                    if not trade_allowed:
-                        if open_side[s] != 0:
-                            logger.warning(f"[{s}] Closing position due to upcoming event.")
-                            if not DRY_RUN:
-                                close_result = close_symbol_positions(s)
-                                if close_result.get("closed_tickets"):
-                                    pending_alerts.update(close_result["closed_tickets"])
-                            last_close_time[s] = now_utc()
-                            open_side[s] = 0
-                            trades_today[s] += 1
-                        tf_side[s][tf] = 0 # Prevent new trades
+                    if SKIP_IF_MINLOTS_EXCEEDS_RISK and estimate_risk_dollars(s, lots, stop_dist) > risk_dollars_from_bps(equity, trade_bps) * RISK_TOLERANCE_MULTIPLIER:
+                        logger.warning(f"[{s}] SKIP confirmed trade: Min lot risk exceeds target.")
                         continue
 
-                    tf_probs[tf] = p_final
-                    tf_atr[tf]   = float(feats["atr14"].iloc[-1])
-
-                    if p_final >= enter_thresh:
-                        tf_side[s][tf] = +1
-                    elif p_final <= 1.0 - enter_thresh:
-                        tf_side[s][tf] = -1
-                    else:
-                        tf_side[s][tf] = 0
-
-                if not updated_any:
-                    continue
-
-                # Combine TFs
-                sides = [tf_side[s][tf] for tf in tfs]
-                if REQUIRE_CONSENSUS and len(tfs) > 1:
-                    nonzero = [x for x in sides if x != 0]
-                    if len(set(nonzero)) == 1 and nonzero:
-                        raw_side = nonzero[0]
-                        size_factor = 1.0
-                    else:
-                        raw_side = 0
-                        size_factor = 0.0
+                    resp = place_market_order(s, signal_side, lots, sl=sl, tp=tp)
+                    logger.info(f"[{s}] EXECUTED confirmed {'LONG' if signal_side>0 else 'SHORT'} lots={lots:.2f}, resp={resp}")
+                    if resp.get("ok"):
+                        open_side[s], last_open_time[s] = signal_side, nowt_loop
+                        trades_today[s] += 1
+                        if resp.get("deal_id") and last_feats is not None:
+                            log_features = {
+                                'technical_p_up': tech_p_up, 'final_p_up': final_p_up,
+                                'rsi14': last_feats["rsi14"].iloc[-1], 'macd_hist': last_feats["macd_hist"].iloc[-1], 'rv96': last_feats["rv96"].iloc[-1],
+                                'ema_dist_norm': (last_feats["ema50"].iloc[-1] - last_feats["ema200"].iloc[-1]) / (last_feats["rv96"].iloc[-1] + 1e-9),
+                                'base_sentiment': latest_sentiment.get(s,{}).get('sentiment_score'),
+                            }
+                            trade_logger.log_open_trade(resp["deal_id"], s, signal_side, lots, entry_price, sl, tp, log_features)
                 else:
-                    nonzero = [x for x in sides if x != 0]
-                    if nonzero:
-                        raw_side = nonzero[0]
-                        size_factor = 1.0
-                    else:
-                        raw_side = 0
-                        size_factor = 0.0
+                    logger.info(f"[{s}] INVALIDATED pending signal by confirming bar.")
+                    pending_signal.pop(s) # Cancel the signal
 
-                atr_vals= [v for v in tf_atr.values() if v is not None]
-                if not atr_vals:
-                    continue
-                atr_use = atr_vals[-1]
+            # --- Step 2: Calculate new signals for the current tick ---
+            tf_probs, tf_atr, updated_any, last_feats = {}, {}, False, None
+            for tf in tfs:
+                df = fetch_bars(s, tf_codes[tf], count=400)
+                if df.empty or len(df) < 200 or df.index[-1] == last_bar_time[s][tf]: continue
+                last_bar_time[s][tf], updated_any = df.index[-1], True
+                feats = build_features(df.iloc[:-1])
+                if feats.empty: continue
+                last_feats = feats
+                p = prob_up_from_feats(feats)
+                tf_probs[tf], tf_atr[tf] = p, float(feats["atr14"].iloc[-1])
+                tf_side[s][tf] = +1 if p >= 0.5 else -1
 
-            # Hysteresis / hold / cooldown / confirmation
-            nowt = now_utc()
-            held_min = (nowt - last_open_time[s]).total_seconds() / 60.0
-            cool_min = (nowt - last_close_time[s]).total_seconds() / 60.0
-            conf = float(np.median(list(tf_probs.values()))) if tf_probs else 0.5
+            if not updated_any: continue
 
-            require_confirmation = strat.get("require_entry_confirmation", False)
-            current = open_side[s]
-            desired = current
+            # --- Step 3: Make decision based on new signal ---
+            sides = [tf_side[s][tf] for tf in tfs]
+            raw_side = sides[0] if sides else 0
+            atr_use = tf_atr.get(tfs[0], 0.0)
+            if not atr_use: continue
 
-            # --- Main decision logic ---
-            if current == 0: # Not in a position
-                if waiting_for_confirmation[s] != 0:
-                    # We have a pending signal and are waiting for confirmation on the new bar
-                    last_candle = df.iloc[-2] # The candle that just closed
-                    confirmed = False
-                    if waiting_for_confirmation[s] > 0 and last_candle['close'] > last_candle['open']:
-                        confirmed = True
-                        logger.info(f"[{s}] LONG signal confirmed by bullish candle.")
-                    elif waiting_for_confirmation[s] < 0 and last_candle['close'] < last_candle['open']:
-                        confirmed = True
-                        logger.info(f"[{s}] SHORT signal confirmed by bearish candle.")
+            tech_p_up = float(np.median(list(tf_probs.values()))) if tf_probs else 0.5
+            final_p_up, reason = get_final_trade_decision(tech_p_up, s, latest_sentiment, latest_events)
 
-                    if confirmed:
-                        desired = waiting_for_confirmation[s]
-                    else:
-                        logger.info(f"[{s}] Entry signal for direction {waiting_for_confirmation[s]} was not confirmed. Signal ignored.")
+            current, desired = open_side[s], open_side[s]
+            p_up, p_down = final_p_up, 1.0 - final_p_up
 
-                    waiting_for_confirmation[s] = 0 # Reset waiting state
+            if current == 0:
+                if (nowt_loop - last_close_time[s]).total_seconds() / 60.0 >= cooldown_min:
+                    if raw_side > 0 and p_up >= enter_thresh: desired = +1
+                    elif raw_side < 0 and p_down >= enter_thresh: desired = -1
+            elif (nowt_loop - last_open_time[s]).total_seconds() / 60.0 >= min_hold_min:
+                if current > 0 and (p_up < exit_thresh or p_down >= enter_thresh): desired = 0
+                elif current < 0 and (p_down < exit_thresh or p_up >= enter_thresh): desired = 0
 
-                elif cool_min >= cooldown_min:
-                    # Check for a new signal
-                    if raw_side > 0 and conf >= enter_thresh:
-                        if require_confirmation:
-                            waiting_for_confirmation[s] = +1
-                            logger.info(f"[{s}] LONG signal received. Waiting for confirmation on next bar.")
-                        else:
-                            desired = +1
-                    elif raw_side < 0 and conf >= enter_thresh:
-                        if require_confirmation:
-                            waiting_for_confirmation[s] = -1
-                            logger.info(f"[{s}] SHORT signal received. Waiting for confirmation on next bar.")
-                        else:
-                            desired = -1
+            if desired == current: continue
 
-            else: # Already in a position
-                waiting_for_confirmation[s] = 0 # Cancel any pending signals if we are already in a trade
-                if held_min >= min_hold_min:
-                    if conf <= exit_thresh or raw_side == 0:
-                        desired = 0 # Signal to close
-                    elif raw_side != current and conf >= enter_thresh:
-                        desired = raw_side # Signal to flip
+            # --- Step 4: Action the decision (Exit, Enter, or set Pending) ---
+            logger.info(f"[{s}] State change: {current}->{desired}. Reason: {reason}, Final p(up)={final_p_up:.3f}")
 
-                # ---------------- Execute if change ----------------
-                if desired == current:
-                    continue
+            if desired == 0: # Exit logic
+                if current != 0 and not DRY_RUN:
+                    res = close_symbol_positions(s)
+                    if res.get("closed_tickets"): pending_alerts.update(res["closed_tickets"])
+                open_side[s], last_close_time[s] = 0, nowt_loop
+                if s in pending_signal: pending_signal.pop(s) # Clear any pending signals too
+                continue
 
-                if desired == 0:
-                    if current != 0 and not DRY_RUN:
-                        close_result = close_symbol_positions(s)
-                        if close_result.get("closed_tickets"):
-                            pending_alerts.update(close_result["closed_tickets"])
-                    logger.info(f"{s}: FLAT (held {held_min:.1f}m)")
-                    last_close_time[s] = nowt
-                    open_side[s] = 0
-                    trades_today[s] += 1
-                    continue
+            # Entry logic
+            if current != 0 and not DRY_RUN: # Flip existing position
+                close_symbol_positions(s)
 
-                # Flip first if needed
-                if current != 0 and desired != current and not DRY_RUN:
-                    close_result = close_symbol_positions(s)
-                    if close_result.get("closed_tickets"):
-                        pending_alerts.update(close_result["closed_tickets"])
-                    last_close_time[s] = nowt
-
-                # Live tick anchor for SL/TP & risk sizing
-                tick_now = mt5.symbol_info_tick(s)
-                if not tick_now:
-                    logger.warning(f"{s}: no tick, skipping")
-                    continue
-                entry_price = tick_now.ask if desired > 0 else tick_now.bid
-
+            if require_entry_confirmation:
+                pending_signal[s] = {
+                    "side": desired,
+                    "bar_time": last_bar_time[s][tfs[0]],
+                    "atr": atr_use,
+                    "feats": last_feats,
+                    "tech_p_up": tech_p_up,
+                    "final_p_up": final_p_up
+                }
+                logger.info(f"[{s}] PENDING {'LONG' if desired > 0 else 'SHORT'} signal, waiting for confirmation on next bar.")
+            else:
+                # --- Execute trade immediately ---
+                tick = mt5.symbol_info_tick(s)
+                if not tick: continue
+                entry_price = tick.ask if desired > 0 else tick.bid
                 sl, tp = calc_sl_tp(desired, entry_price, atr_use, sl_mult, tp_mult)
                 sl, tp = enforce_min_distance(s, desired, entry_price, sl, tp)
-
                 stop_dist = abs(entry_price - sl)
                 equity = account_equity()
+                lots = lots_for_risk(s, equity, stop_dist, trade_bps)
 
-                lots_base = lots_for_risk(s, equity, stop_dist, trade_bps)
-                lots = max(round(lots_base * size_factor, 3), 0.01)
+                if SKIP_IF_MINLOTS_EXCEEDS_RISK and estimate_risk_dollars(s, lots, stop_dist) > risk_dollars_from_bps(equity, trade_bps) * RISK_TOLERANCE_MULTIPLIER:
+                    logger.warning(f"[{s}] SKIP: Min lot risk exceeds target.")
+                    continue
 
-                if SKIP_IF_MINLOTS_EXCEEDS_RISK:
-                    risk_target = risk_dollars_from_bps(equity, trade_bps) * RISK_TOLERANCE_MULTIPLIER
-                    est_risk = estimate_risk_dollars(s, lots, stop_dist)
-                    if est_risk > risk_target + 1e-9:
-                        logger.info(f"{s}: SKIP — min lot risk ${est_risk:.2f} > target ${risk_target:.2f} "
-                                    f"(stop={stop_dist:.5f}, lots={lots})")
-                        continue
+                resp = place_market_order(s, desired, lots, sl=sl, tp=tp)
+                logger.info(f"[{s}] EXECUTED immediate {'LONG' if desired>0 else 'SHORT'} lots={lots:.2f}, resp={resp}")
+                if resp.get("ok"):
+                    open_side[s], last_open_time[s] = desired, nowt_loop
+                    trades_today[s] += 1
+                    if resp.get("deal_id") and last_feats is not None:
+                        log_features = {
+                            'technical_p_up': tech_p_up, 'final_p_up': final_p_up,
+                            'rsi14': last_feats["rsi14"].iloc[-1], 'macd_hist': last_feats["macd_hist"].iloc[-1], 'rv96': last_feats["rv96"].iloc[-1],
+                            'ema_dist_norm': (last_feats["ema50"].iloc[-1] - last_feats["ema200"].iloc[-1]) / (last_feats["rv96"].iloc[-1] + 1e-9),
+                            'base_sentiment': latest_sentiment.get(s,{}).get('sentiment_score'),
+                        }
+                        trade_logger.log_open_trade(resp["deal_id"], s, desired, lots, entry_price, sl, tp, log_features)
 
-                resp = {"ok": True, "retcode": "DRY", "comment": "simulated", "deal_id": None} if DRY_RUN \
-                       else place_market_order(s, desired, lots, sl=sl, tp=tp)
-
-                logger.info(f"{s}: {'LONG' if desired>0 else 'SHORT'} lots={lots:.2f} "
-                            f"SL={sl:.5f} TP={tp:.5f} (risk {trade_bps}bps) resp={resp}")
-
-                if resp.get("ok") and resp.get("deal_id"):
-                    time.sleep(0.5) # Give a moment for the deal to be recorded in history
-                    deal = mt5.history_deals_get(ticket=resp["deal_id"])
-                    if deal and len(deal) == 1:
-                        position_id = deal[0].position_id
-
-                        # Log the trade decision context
-                        log_features = features.copy()
-                        log_features.update({
-                            'rsi14': feats["rsi14"].iloc[-1],
-                            'macd_hist': feats["macd_hist"].iloc[-1],
-                            'rv96': feats["rv96"].iloc[-1],
-                            'ema_dist_norm': (feats["ema50"].iloc[-1] - feats["ema200"].iloc[-1]) / (float(feats["rv96"].iloc[-1]) + 1e-9),
-                        })
-                        trade_logger.log_open_trade(position_id, s, desired, lots, entry_price, sl, tp, log_features)
-                    else:
-                        logger.warning(f"[{s}] Could not retrieve deal details for deal_id {resp['deal_id']} to log trade open.")
-
-                last_open_time[s] = nowt
-                open_side[s] = desired
-                trades_today[s] += 1
-
-            time.sleep(30)  # ~2 checks per minute on M5
-
-    except KeyboardInterrupt:
-        logger.info("Shutdown signal received.")
-    finally:
-        stop_event.set()
-        if 'worker_thread' in locals() and worker_thread.is_alive():
-            logger.info("Waiting for background worker to stop...")
-            worker_thread.join()
-        mt5.shutdown()
-        logger.info("MT5 connection shut down. Bot stopped.")
+        time.sleep(20)
 
 if __name__ == "__main__":
     main()

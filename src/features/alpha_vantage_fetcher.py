@@ -1,85 +1,86 @@
-from __future__ import annotations
-from typing import List, Dict, Any
-import datetime as dt
-from loguru import logger
 import requests
+from loguru import logger
+from collections import defaultdict
 
-class AlphaVantageFetcher:
-    def __init__(self, api_key: str):
-        if not api_key:
-            raise ValueError("Alpha Vantage API key is required.")
-        self.api_key = api_key
+def fetch_news_sentiments(api_key: str, symbols: list[str]) -> dict:
+    """
+    Fetches news and sentiment scores from Alpha Vantage for a list of symbols.
+    It calculates a relevance-weighted average sentiment score per symbol.
 
-    def fetch_forex_news(self, topics: List[str] = None, tickers: List[str] = None) -> List[Dict[str, Any]]:
-        """
-        Fetches news and sentiment from Alpha Vantage.
+    API docs: https://www.alphavantage.co/documentation/#news-sentiment
+    """
+    if not api_key:
+        logger.warning("Alpha Vantage API key not provided. Skipping news fetch.")
+        return {}
 
-        Args:
-            topics: A list of topics to filter by (e.g., ['economy_monetary', 'forex']).
-            tickers: A list of tickers to filter by (e.g., ['FOREX:USD', 'FOREX:EUR']).
+    # The API takes Forex pairs like 'EURUSD' as tickers.
+    # It also supports general topics like 'FOREX'.
+    tickers = "FOREX," + ",".join(symbols)
 
-        Returns:
-            A list of standardized news article dictionaries.
-        """
-        try:
-            base_url = "https://www.alphavantage.co/query"
-            params = {
-                "function": "NEWS_SENTIMENT",
-                "apikey": self.api_key,
-                "limit": 100, # Fetch a good number of articles
-            }
-            if topics:
-                params["topics"] = ",".join(topics)
-            if tickers:
-                params["tickers"] = ",".join(tickers)
+    url = (
+        f'https://www.alphavantage.co/query?function=NEWS_SENTIMENT'
+        f'&tickers={tickers}'
+        f'&apikey={api_key}'
+        f'&limit=50'  # Fetch last 50 relevant articles
+    )
 
-            logger.info(f"Fetching news from Alpha Vantage with params: {params}")
-            response = requests.get(base_url, params=params)
-            response.raise_for_status()
-            data = response.json()
+    try:
+        response = requests.get(url, timeout=20)
+        response.raise_for_status()
+        data = response.json()
 
-            if "feed" not in data:
-                logger.warning(f"No 'feed' key in Alpha Vantage response. Response: {data}")
-                return []
+        if "feed" not in data or not data["feed"]:
+            logger.info(f"No news found for tickers: {tickers}")
+            return {}
 
-            articles = []
-            for article in data.get("feed", []):
-                main_sentiment_score = 0.0
-                mentioned_currencies = []
+        # Process the feed to get an average sentiment per ticker
+        # We will store a tuple of (weighted_score, relevance_sum)
+        sentiment_data = defaultdict(lambda: [0.0, 0.0])
 
-                if article.get("ticker_sentiment"):
-                    sorted_tickers = sorted(article["ticker_sentiment"], key=lambda x: float(x.get('relevance_score', 0)), reverse=True)
-                    if sorted_tickers:
-                        main_sentiment_score = float(sorted_tickers[0].get('ticker_sentiment_score', 0.0))
+        for article in data.get('feed', []):
+            for ticker_sentiment in article.get('ticker_sentiment', []):
+                symbol = ticker_sentiment.get('ticker')
+                # The API uses FOREX:EURUSD format, we just want EURUSD
+                symbol_clean = symbol.split(':')[-1]
 
-                    for sent in article["ticker_sentiment"]:
-                        ticker = sent.get('ticker', '')
-                        if 'FOREX' in ticker:
-                            currency = ticker.split(':')[1]
-                            if currency not in mentioned_currencies:
-                                mentioned_currencies.append(currency)
+                if symbol_clean in symbols:
+                    try:
+                        relevance = float(ticker_sentiment.get('relevance_score', 0.0))
+                        sentiment = float(ticker_sentiment.get('ticker_sentiment_score', 0.0))
 
-                articles.append({
-                    "source": article.get("source"),
-                    "title": article.get("title"),
-                    "description": article.get("summary"),
-                    "url": article.get("url"),
-                    "publishedAt": article.get("time_published"),
-                    "sentiment": main_sentiment_score,
-                    "currencies": mentioned_currencies,
-                    "timestamp": self._parse_timestamp(article.get("time_published")),
-                })
+                        # Accumulate weighted score and total relevance
+                        sentiment_data[symbol_clean][0] += sentiment * relevance
+                        sentiment_data[symbol_clean][1] += relevance
+                    except (ValueError, TypeError):
+                        continue
 
-            logger.info(f"Fetched and processed {len(articles)} articles from Alpha Vantage.")
-            return articles
+        # Calculate the final average sentiment for each symbol
+        avg_sentiments = {}
+        for symbol, (weighted_score_sum, relevance_sum) in sentiment_data.items():
+            if relevance_sum > 0:
+                avg_score = weighted_score_sum / relevance_sum
 
-        except requests.exceptions.RequestException as e:
-            logger.exception(f"An error occurred while fetching news from Alpha Vantage: {e}")
-            return []
-        except (ValueError, KeyError, TypeError) as e:
-            logger.exception(f"Error processing data from Alpha Vantage: {e}")
-            return []
+                # Determine a qualitative label
+                if avg_score >= 0.15:
+                    label = 'BULLISH'
+                elif avg_score <= -0.15:
+                    label = 'BEARISH'
+                else:
+                    label = 'NEUTRAL'
 
-    def _parse_timestamp(self, ts_str: str) -> dt.datetime:
-        # Alpha Vantage timestamp is like "20220410T013000"
-        return dt.datetime.strptime(ts_str, '%Y%m%dT%H%M%S').replace(tzinfo=dt.timezone.utc)
+                avg_sentiments[symbol] = {
+                    "sentiment_score": round(avg_score, 4),
+                    "sentiment_label": label,
+                    "relevance_sum": round(relevance_sum, 4)
+                }
+
+        if avg_sentiments:
+            logger.info(f"Fetched and processed sentiments from Alpha Vantage: {avg_sentiments}")
+        return avg_sentiments
+
+    except requests.exceptions.RequestException as e:
+        logger.exception(f"Failed to fetch news from Alpha Vantage: {e}")
+    except Exception as e:
+        logger.exception(f"Error processing Alpha Vantage data: {e}")
+
+    return {}

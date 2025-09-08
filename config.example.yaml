@@ -5,16 +5,15 @@ timeframes: ["M5"]
 risk:
   max_risk_per_trade_bps: 100
   stop_atr_mult: 1.8
+  takeprofit_atr_mult: 2.6
+  kill_switch:
+    max_intraday_drawdown_pct: 2.0
+    max_daily_trades_per_symbol: 6
 strategy:
   enter_thresh: 0.62
   exit_thresh: 0.55
   min_hold_min: 15
   cooldown_min: 10
-  require_entry_confirmation: true
-  takeprofit_atr_mult: 2.6
-  kill_switch:
-    max_intraday_drawdown_pct: 2.0
-    max_daily_trades_per_symbol: 6
 trading_window:
   enabled: true
   start_hour_utc: 6
@@ -24,15 +23,3 @@ alerts:
   telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
   telegram_chat_id_env: "TELEGRAM_CHAT_ID"
   alert_on_trade_close: true
-news:
-  enabled: true
-  # --- Provider: newsapi.org ---
-  news_api_key_env: "NEWS_API_KEY" # Used if provider is 'newsapi'
-  keywords: ["forex", "currency", "central bank", "interest rates", "inflation", "GDP", "fed", "ecb"]
-  sources: [] # Optional for newsapi: e.g., ["reuters", "bloomberg"]
-  # --- Provider: alphavantage ---
-  alpha_vantage_api_key_env: "ALPHA_VANTAGE_API_KEY" # Used if provider is 'alphavantage'
-  provider: "newsapi" # can be 'newsapi' or 'alphavantage'
-fundamental:
-  enabled: true
-  importances: ["high", "medium"] # high, medium, low

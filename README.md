@@ -58,15 +58,11 @@ Optimized for **low-equity accounts** and tuned for the **M5 timeframe**.
    * Edit `config.yaml` to set your trading symbols, timeframes, and risk controls.
 
 4. **Add environment variables**:
-   Create a `.env` file in the repo root. You will need a Telegram Bot Token and Chat ID for alerts, and a NewsAPI key for the sentiment analysis feature. You can get a free developer key from [newsapi.org](https://newsapi.org).
+   Create a `.env` file in the repo root:
 
    ```ini
    TELEGRAM_BOT_TOKEN=your_bot_token
    TELEGRAM_CHAT_ID=your_chat_id
-
-   # --- CHOOSE ONE NEWS PROVIDER ---
-   NEWS_API_KEY=your_newsapi_key_from_newsapi.org
-   ALPHA_VANTAGE_API_KEY=your_alphavantage_key
    ```
 
 5. **Run the bot**:

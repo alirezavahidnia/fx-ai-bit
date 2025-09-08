@@ -24,6 +24,7 @@ strategy:
   exit_thresh: 0.45
   min_hold_min: 30
   cooldown_min: 10
+  require_entry_confirmation: false    # If true, waits for a confirming candle before entering
 
 
 alerts:
