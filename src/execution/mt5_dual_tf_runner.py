@@ -809,14 +809,14 @@ def main():
                 atr_use = atr_vals[-1]
 
             # Hysteresis / hold / cooldown / confirmation
-                nowt = now_utc()
-                held_min = (nowt - last_open_time[s]).total_seconds() / 60.0
-                cool_min = (nowt - last_close_time[s]).total_seconds() / 60.0
-                conf = float(np.median(list(tf_probs.values()))) if tf_probs else 0.5
+            nowt = now_utc()
+            held_min = (nowt - last_open_time[s]).total_seconds() / 60.0
+            cool_min = (nowt - last_close_time[s]).total_seconds() / 60.0
+            conf = float(np.median(list(tf_probs.values()))) if tf_probs else 0.5
 
             require_confirmation = strat.get("require_entry_confirmation", False)
-                current = open_side[s]
-                desired = current
+            current = open_side[s]
+            desired = current
 
             # --- Main decision logic ---
             if current == 0: # Not in a position
@@ -840,13 +840,13 @@ def main():
 
                 elif cool_min >= cooldown_min:
                     # Check for a new signal
-                        if raw_side > 0 and conf >= enter_thresh:
+                    if raw_side > 0 and conf >= enter_thresh:
                         if require_confirmation:
                             waiting_for_confirmation[s] = +1
                             logger.info(f"[{s}] LONG signal received. Waiting for confirmation on next bar.")
                         else:
                             desired = +1
-                        elif raw_side < 0 and conf >= enter_thresh:
+                    elif raw_side < 0 and conf >= enter_thresh:
                         if require_confirmation:
                             waiting_for_confirmation[s] = -1
                             logger.info(f"[{s}] SHORT signal received. Waiting for confirmation on next bar.")
@@ -855,10 +855,10 @@ def main():
 
             else: # Already in a position
                 waiting_for_confirmation[s] = 0 # Cancel any pending signals if we are already in a trade
-                    if held_min >= min_hold_min:
-                        if conf <= exit_thresh or raw_side == 0:
+                if held_min >= min_hold_min:
+                    if conf <= exit_thresh or raw_side == 0:
                         desired = 0 # Signal to close
-                        elif raw_side != current and conf >= enter_thresh:
+                    elif raw_side != current and conf >= enter_thresh:
                         desired = raw_side # Signal to flip
 
                 # ---------------- Execute if change ----------------
