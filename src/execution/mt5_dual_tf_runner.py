@@ -630,6 +630,7 @@ def main():
     last_bar_time: Dict[str, Dict[str, pd.Timestamp]] = {s: {tf: pd.Timestamp(0, tz="UTC") for tf in tfs} for s in symbols}
     tf_side: Dict[str, Dict[str, int]] = {s: {tf: 0 for tf in tfs} for s in symbols}
     open_side: Dict[str, int] = {s: 0 for s in symbols}
+    waiting_for_confirmation: Dict[str, int] = {s: 0 for s in symbols}
     trades_today: Dict[str, int] = {s: 0 for s in symbols}
     last_open_time: Dict[str, dt.datetime]  = {s: dt.datetime.min.replace(tzinfo=dt.timezone.utc) for s in symbols}
     last_close_time: Dict[str, dt.datetime] = {s: dt.datetime.min.replace(tzinfo=dt.timezone.utc) for s in symbols}
@@ -807,27 +808,58 @@ def main():
                     continue
                 atr_use = atr_vals[-1]
 
-                # Hysteresis / hold / cooldown
+            # Hysteresis / hold / cooldown / confirmation
                 nowt = now_utc()
                 held_min = (nowt - last_open_time[s]).total_seconds() / 60.0
                 cool_min = (nowt - last_close_time[s]).total_seconds() / 60.0
                 conf = float(np.median(list(tf_probs.values()))) if tf_probs else 0.5
 
+            require_confirmation = strat.get("require_entry_confirmation", False)
                 current = open_side[s]
                 desired = current
 
-                if current == 0:
-                    if cool_min >= cooldown_min:
+            # --- Main decision logic ---
+            if current == 0: # Not in a position
+                if waiting_for_confirmation[s] != 0:
+                    # We have a pending signal and are waiting for confirmation on the new bar
+                    last_candle = df.iloc[-2] # The candle that just closed
+                    confirmed = False
+                    if waiting_for_confirmation[s] > 0 and last_candle['close'] > last_candle['open']:
+                        confirmed = True
+                        logger.info(f"[{s}] LONG signal confirmed by bullish candle.")
+                    elif waiting_for_confirmation[s] < 0 and last_candle['close'] < last_candle['open']:
+                        confirmed = True
+                        logger.info(f"[{s}] SHORT signal confirmed by bearish candle.")
+
+                    if confirmed:
+                        desired = waiting_for_confirmation[s]
+                    else:
+                        logger.info(f"[{s}] Entry signal for direction {waiting_for_confirmation[s]} was not confirmed. Signal ignored.")
+
+                    waiting_for_confirmation[s] = 0 # Reset waiting state
+
+                elif cool_min >= cooldown_min:
+                    # Check for a new signal
                         if raw_side > 0 and conf >= enter_thresh:
+                        if require_confirmation:
+                            waiting_for_confirmation[s] = +1
+                            logger.info(f"[{s}] LONG signal received. Waiting for confirmation on next bar.")
+                        else:
                             desired = +1
                         elif raw_side < 0 and conf >= enter_thresh:
+                        if require_confirmation:
+                            waiting_for_confirmation[s] = -1
+                            logger.info(f"[{s}] SHORT signal received. Waiting for confirmation on next bar.")
+                        else:
                             desired = -1
-                else:
+
+            else: # Already in a position
+                waiting_for_confirmation[s] = 0 # Cancel any pending signals if we are already in a trade
                     if held_min >= min_hold_min:
                         if conf <= exit_thresh or raw_side == 0:
-                            desired = 0
+                        desired = 0 # Signal to close
                         elif raw_side != current and conf >= enter_thresh:
-                            desired = raw_side
+                        desired = raw_side # Signal to flip
 
                 # ---------------- Execute if change ----------------
                 if desired == current:

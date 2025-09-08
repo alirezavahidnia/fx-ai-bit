@@ -5,6 +5,12 @@ timeframes: ["M5"]
 risk:
   max_risk_per_trade_bps: 100
   stop_atr_mult: 1.8
+strategy:
+  enter_thresh: 0.62
+  exit_thresh: 0.55
+  min_hold_min: 15
+  cooldown_min: 10
+  require_entry_confirmation: true
   takeprofit_atr_mult: 2.6
   kill_switch:
     max_intraday_drawdown_pct: 2.0
