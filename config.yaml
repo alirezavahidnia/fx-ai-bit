@@ -32,5 +32,8 @@ alerts:
   telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
   telegram_chat_id_env: "TELEGRAM_CHAT_ID"
 
+api_keys:
+  alpha_vantage_api_key_env: "AV_API_KEY" # Name of the env var for the Alpha Vantage key
+
 costs:
   spread_bps_default: 1.2

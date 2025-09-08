@@ -66,7 +66,10 @@ def background_data_updater(cfg: dict, symbols: list[str]):
     """
     global shared_data
 
-    av_api_key = os.getenv(cfg.get("alpha_vantage_api_key_env"))
+    api_cfg = cfg.get("api_keys", {})
+    av_api_key_env_name = api_cfg.get("alpha_vantage_api_key_env")
+    av_api_key = os.getenv(av_api_key_env_name) if av_api_key_env_name else None
+
     news_provider = cfg.get("news_provider", "alphavantage" if av_api_key else None)
 
     while True:
@@ -212,16 +215,28 @@ def calc_sl_tp(side: int, price: float, atr_val: float, sl_mult: float, tp_mult:
 
 def enforce_min_distance(symbol: str, side: int, entry: float, sl: float, tp: float) -> Tuple[float, float]:
     info = symbol_info_or_raise(symbol)
-    point = info.point
-    min_dist = info.stops_level * point
-    if min_dist <= 0: return sl, tp
-    if side > 0:
+    point = getattr(info, 'point', 0.00001)
+
+    # Use getattr for safety, as some brokers might not provide this field.
+    stops_level_pips = getattr(info, 'stops_level', 0)
+    min_dist = stops_level_pips * point
+
+    if min_dist <= 0:
+        return sl, tp
+
+    if side > 0: # Long
         sl = min(sl, entry - min_dist)
         tp = max(tp, entry + min_dist)
-    else:
+    else: # Short
         sl = max(sl, entry + min_dist)
         tp = min(tp, entry - min_dist)
-    return round(sl / point) * point, round(tp / point) * point
+
+    # Snap to grid, ensuring we don't divide by zero
+    if point > 0:
+        sl = round(sl / point) * point
+        tp = round(tp / point) * point
+
+    return sl, tp
 
 def place_market_order(symbol: str, side: int, lots: float, sl: float | None=None, tp: float | None=None) -> dict:
     info = symbol_info_or_raise(symbol)
