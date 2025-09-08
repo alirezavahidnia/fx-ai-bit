@@ -451,7 +451,90 @@ def estimate_risk_dollars(symbol: str, lots: float, stop_distance_price: float) 
     risk_per_lot = (stop_distance_price / float(tick_size)) * float(tick_value)
     return float(risk_per_lot) * float(lots)
 
+def external_data_worker(
+    stop_event: threading.Event,
+    shared_data: dict,
+    lock: threading.Lock,
+    cfg: dict,
+    all_currencies: list[str],
+):
+    """
+    A worker function that runs in a background thread to fetch news and calendar data.
+    """
+    logger.info("Background data worker started.")
+
+    # Unpack config for this thread
+    news_cfg = cfg.get("news", {})
+    news_enabled = news_cfg.get("enabled", False)
+    news_provider = news_cfg.get("provider", "newsapi")
+    news_fetcher = shared_data.get("news_fetcher")
+    sentiment_analyzer = shared_data.get("sentiment_analyzer")
+    news_keywords = news_cfg.get("keywords", [])
+    news_sources = news_cfg.get("sources", [])
+    news_topics = news_cfg.get("topics", ["forex", "economy_monetary"])
+
+    fundamental_cfg = cfg.get("fundamental", {})
+    fundamental_enabled = fundamental_cfg.get("enabled", True)
+    calendar_importances = fundamental_cfg.get("importances", ["high"])
+
+    news_interval_sec = 30 * 60
+    calendar_interval_sec = 60 * 60
+    last_news_fetch_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    last_calendar_fetch_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+
+    while not stop_event.is_set():
+        now = now_utc()
+
+        # --- Fetch News & Sentiment periodically ---
+        if news_enabled and news_fetcher and (now - last_news_fetch_time).total_seconds() >= news_interval_sec:
+            logger.info(f"[BG] Fetching news from provider: {news_provider}...")
+            try:
+                articles = []
+                if news_provider == 'alphavantage':
+                    av_tickers = [f"FOREX:{c}" for c in all_currencies]
+                    articles = news_fetcher.fetch_forex_news(topics=news_topics, tickers=av_tickers)
+                elif news_provider == 'newsapi':
+                    articles = news_fetcher.fetch_forex_news(keywords=news_keywords, sources=news_sources)
+                    if articles:
+                        for art in articles:
+                            art['timestamp'] = dt.datetime.fromisoformat(art['publishedAt'].replace('Z', '+00:00'))
+                            art['currencies'] = [c for c in all_currencies if c.lower() in (art.get('title','').lower() or '') or c.lower() in (art.get('description','').lower() or '')]
+                            art['sentiment'] = sentiment_analyzer.score(art.get('title','') + " " + art.get('description',''))
+
+                if articles:
+                    sentiment_data = aggregate_currency_sentiment(articles)
+                    with lock:
+                        shared_data['currency_sentiment'] = sentiment_data
+                        shared_data['last_sentiment_update'] = now
+                    logger.info(f"[BG] Updated currency sentiment: {sentiment_data}")
+
+            except Exception as e:
+                logger.exception(f"[BG] Error during news fetch/sentiment analysis: {e}")
+            last_news_fetch_time = now
+
+        # --- Fetch Economic Calendar periodically ---
+        if fundamental_enabled and (now - last_calendar_fetch_time).total_seconds() >= calendar_interval_sec:
+            logger.info("[BG] Fetching economic calendar...")
+            try:
+                events = get_economic_calendar(all_currencies, calendar_importances)
+                with lock:
+                    shared_data['upcoming_events'] = events
+                    shared_data['last_calendar_update'] = now
+                if not events.empty:
+                    logger.info(f"[BG] Found {len(events)} upcoming economic events.")
+            except Exception as e:
+                logger.exception(f"[BG] Error during economic calendar fetch: {e}")
+            last_calendar_fetch_time = now
+
+        stop_event.wait(60) # Check for stop signal every minute
+
+    logger.info("Background data worker stopped.")
+
+
 # ================= Main =================
+import threading
+import copy
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--symbols", default=None, help="Comma-separated override (e.g., EURUSD,GBPUSD)")
@@ -488,7 +571,7 @@ def main():
     daily_dd_max   = float(kill.get("max_intraday_drawdown_pct", 4.0))
     max_trades_day = int(kill.get("max_daily_trades_per_symbol", 6))
 
-    # --- News and Sentiment config ---
+    # --- Initialize News and Sentiment Fetchers ---
     news_cfg = cfg.get("news", {})
     news_enabled = news_cfg.get("enabled", False)
     news_provider = news_cfg.get("provider", "newsapi")
@@ -503,7 +586,6 @@ def main():
                 news_enabled = False
             else:
                 news_fetcher = AlphaVantageFetcher(api_key=api_key)
-                logger.info("News provider set to Alpha Vantage.")
         elif news_provider == "newsapi":
             api_key = os.getenv(news_cfg.get("news_api_key_env", "NEWS_API_KEY"))
             if not api_key:
@@ -513,25 +595,31 @@ def main():
                 try:
                     news_fetcher = NewsFetcher(api_key=api_key)
                     sentiment_analyzer = FinBertSentiment()
-                    logger.info("News provider set to NewsAPI with FinBERT sentiment.")
                 except Exception as e:
                     logger.exception(f"Failed to initialize FinBERT, disabling news feature: {e}")
                     news_enabled = False
-        else:
-            logger.warning(f"Unknown news provider '{news_provider}'. Disabling news feature.")
-            news_enabled = False
 
-        news_keywords = news_cfg.get("keywords", [])
-        news_sources = news_cfg.get("sources", []) # Only used by newsapi
-        news_topics = news_cfg.get("topics", ["forex", "economy_monetary"]) # Only used by alphavantage
+    all_currencies = list(set([s[:3] for s in symbols] + [s[3:] for s in symbols]))
 
-    # --- Fundamental Analysis config ---
-    fundamental_cfg = cfg.get("fundamental", {})
-    fundamental_enabled = fundamental_cfg.get("enabled", True)
-    if fundamental_enabled:
-        all_currencies = list(set([s[:3] for s in symbols] + [s[3:] for s in symbols]))
-        calendar_importances = fundamental_cfg.get("importances", ["high"])
-        logger.info(f"Fundamental analysis enabled for currencies: {all_currencies}")
+    # --- Shared data for background thread ---
+    shared_data = {
+        'currency_sentiment': {c: 0.0 for c in all_currencies},
+        'upcoming_events': pd.DataFrame(),
+        'last_sentiment_update': dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        'last_calendar_update': dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        'news_fetcher': news_fetcher,
+        'sentiment_analyzer': sentiment_analyzer,
+    }
+    data_lock = threading.Lock()
+    stop_event = threading.Event()
+
+    # --- Start background data worker ---
+    worker_thread = threading.Thread(
+        target=external_data_worker,
+        args=(stop_event, shared_data, data_lock, cfg, all_currencies),
+        daemon=True
+    )
+    worker_thread.start()
 
 
     if not mt5.initialize():
@@ -545,6 +633,8 @@ def main():
     trades_today: Dict[str, int] = {s: 0 for s in symbols}
     last_open_time: Dict[str, dt.datetime]  = {s: dt.datetime.min.replace(tzinfo=dt.timezone.utc) for s in symbols}
     last_close_time: Dict[str, dt.datetime] = {s: dt.datetime.min.replace(tzinfo=dt.timezone.utc) for s in symbols}
+    pending_alerts = set()
+    trade_logger = TradeLogger()
 
     # --- Sync with any live positions in MT5 ---
     positions = mt5.positions_get()
@@ -566,291 +656,264 @@ def main():
     equity_day_open = account_equity()
     paused_for_dd = False
 
-    # --- External data state ---
-    last_news_fetch_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-    last_calendar_fetch_time = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
-    currency_sentiment = {c: 0.0 for c in all_currencies} if fundamental_enabled else {}
-    upcoming_events = pd.DataFrame()
-    pending_alerts = set()
-    trade_logger = TradeLogger()
-
     logger.info("🟢 Bot started (M5 FX, low-equity safe).")
 
-    while True:
-        nowt_loop = now_utc()
+    try:
+        while True:
+            nowt_loop = now_utc()
 
-        # --- Fetch News & Sentiment periodically ---
-        if news_enabled and news_fetcher and (nowt_loop - last_news_fetch_time).total_seconds() >= 30 * 60:
-            logger.info(f"Fetching news from provider: {news_provider}...")
-            try:
-                articles = []
-                if news_provider == 'alphavantage':
-                    av_tickers = [f"FOREX:{c}" for c in all_currencies]
-                    articles = news_fetcher.fetch_forex_news(topics=news_topics, tickers=av_tickers)
-                elif news_provider == 'newsapi':
-                    articles = news_fetcher.fetch_forex_news(keywords=news_keywords, sources=news_sources)
-                    if articles:
-                        # Post-process for newsapi
-                        for art in articles:
-                            art['timestamp'] = dt.datetime.fromisoformat(art['publishedAt'].replace('Z', '+00:00'))
-                            art['currencies'] = [c for c in all_currencies if c.lower() in (art.get('title','').lower() or '') or c.lower() in (art.get('description','').lower() or '')]
-                            art['sentiment'] = sentiment_analyzer.score(art.get('title','') + " " + art.get('description',''))
+            # --- Get latest data from shared state ---
+            with data_lock:
+                local_sentiment = copy.deepcopy(shared_data['currency_sentiment'])
+                local_events = shared_data['upcoming_events'].copy()
+                last_sent_update = shared_data['last_sentiment_update']
+                last_cal_update = shared_data['last_calendar_update']
 
-                if articles:
-                    currency_sentiment = aggregate_currency_sentiment(articles)
-                    logger.info(f"Updated currency sentiment: {currency_sentiment}")
+            logger.debug(f"Using sentiment data from {last_sent_update} ({(nowt_loop - last_sent_update).total_seconds():.0f}s ago)")
+            logger.debug(f"Using calendar data from {last_cal_update} ({(nowt_loop - last_cal_update).total_seconds():.0f}s ago)")
 
-            except Exception as e:
-                logger.exception(f"Error during news fetch/sentiment analysis: {e}")
-            last_news_fetch_time = nowt_loop
+            # --- Process pending trade close alerts ---
+            if pending_alerts and cfg.get("alerts", {}).get("alert_on_trade_close"):
+                # Fetch deals from the start of the bot run to be safe
+                deals = mt5.history_deals_get(day_start, nowt_loop)
+                if deals:
+                    processed_alerts = set()
+                    for deal in deals:
+                        if deal.position_id in pending_alerts and deal.entry == mt5.DEAL_ENTRY_OUT:
+                            try:
+                                # Log the close event
+                                pnl = deal.profit + deal.commission + deal.swap
+                                trade_logger.log_close_trade(deal.position_id, pnl)
 
-        # --- Fetch Economic Calendar periodically ---
-        if fundamental_enabled and (nowt_loop - last_calendar_fetch_time).total_seconds() >= 60 * 60:
-            logger.info("Fetching economic calendar...")
-            try:
-                upcoming_events = get_economic_calendar(all_currencies, calendar_importances)
-                if not upcoming_events.empty:
-                    logger.info(f"Found {len(upcoming_events)} upcoming economic events.")
-            except Exception as e:
-                logger.exception(f"Error during economic calendar fetch: {e}")
-            last_calendar_fetch_time = nowt_loop
+                                # Send Telegram alert
+                                msg = format_trade_close_alert(deal)
+                                send_telegram_alert(cfg, msg)
+                                processed_alerts.add(deal.position_id)
+                            except Exception as e:
+                                logger.exception(f"Failed to process trade close event for deal {deal.ticket}: {e}")
 
-        # --- Process pending trade close alerts ---
-        if pending_alerts and cfg.get("alerts", {}).get("alert_on_trade_close"):
-            # Fetch deals from the start of the bot run to be safe
-            deals = mt5.history_deals_get(day_start, nowt_loop)
-            if deals:
-                processed_alerts = set()
-                for deal in deals:
-                    if deal.position_id in pending_alerts and deal.entry == mt5.DEAL_ENTRY_OUT:
-                        try:
-                            # Log the close event
-                            pnl = deal.profit + deal.commission + deal.swap
-                            trade_logger.log_close_trade(deal.position_id, pnl)
-
-                            # Send Telegram alert
-                            msg = format_trade_close_alert(deal)
-                            send_telegram_alert(cfg, msg)
-                            processed_alerts.add(deal.position_id)
-                        except Exception as e:
-                            logger.exception(f"Failed to process trade close event for deal {deal.ticket}: {e}")
-
-                if processed_alerts:
-                    pending_alerts.difference_update(processed_alerts)
+                    if processed_alerts:
+                        pending_alerts.difference_update(processed_alerts)
 
 
-        # New day: send summary then reset counters
-        if nowt_loop >= day_start + dt.timedelta(days=1):
-            try:
-                end_ts = now_utc()
-                summary = build_daily_summary(day_start, end_ts, symbols)
-                msg = format_daily_summary(day_start, end_ts, summary)
-                send_telegram_alert(cfg, msg)
-            except Exception as e:
-                logger.exception(f"Daily summary failed: {e}")
+            # New day: send summary then reset counters
+            if nowt_loop >= day_start + dt.timedelta(days=1):
+                try:
+                    end_ts = now_utc()
+                    summary = build_daily_summary(day_start, end_ts, symbols)
+                    msg = format_daily_summary(day_start, end_ts, summary)
+                    send_telegram_alert(cfg, msg)
+                except Exception as e:
+                    logger.exception(f"Daily summary failed: {e}")
 
-            day_start = today_utc_start()
-            equity_day_open = account_equity()
-            trades_today = {s: 0 for s in symbols}
-            paused_for_dd = False
-            logger.info("🔄 New UTC day: counters reset")
+                day_start = today_utc_start()
+                equity_day_open = account_equity()
+                trades_today = {s: 0 for s in symbols}
+                paused_for_dd = False
+                logger.info("🔄 New UTC day: counters reset")
 
-        # Kill-switch
-        eq = account_equity()
-        dd_pct = (eq - equity_day_open) / max(equity_day_open, 1e-9) * 100.0
-        if dd_pct <= -abs(daily_dd_max) and not paused_for_dd:
-            if not DRY_RUN:
-                for s in symbols:
-                    close_symbol_positions(s)
-            paused_for_dd = True
-            logger.error(f"⛔ Kill-switch: DD {dd_pct:.2f}% ≤ {daily_dd_max}% — flattened & paused")
-        if paused_for_dd:
-            time.sleep(60)
-            continue
-
-        if not within_trading_window(cfg):
-            time.sleep(10)
-            continue
-
-        for s in symbols:
-            if trades_today[s] >= max_trades_day:
+            # Kill-switch
+            eq = account_equity()
+            dd_pct = (eq - equity_day_open) / max(equity_day_open, 1e-9) * 100.0
+            if dd_pct <= -abs(daily_dd_max) and not paused_for_dd:
+                if not DRY_RUN:
+                    for s in symbols:
+                        close_symbol_positions(s)
+                paused_for_dd = True
+                logger.error(f"⛔ Kill-switch: DD {dd_pct:.2f}% ≤ {daily_dd_max}% — flattened & paused")
+            if paused_for_dd:
+                time.sleep(60)
                 continue
 
-            tf_probs = {}
-            tf_atr   = {}
-            updated_any = False
+            if not within_trading_window(cfg):
+                time.sleep(10)
+                continue
 
-            for tf in tfs:
-                df = fetch_bars(s, tf_codes[tf], count=400)  # ~33h on M5
-                if df.empty or len(df) < 200:
-                    continue
-                last = df.index[-1]
-                if last == last_bar_time[s][tf]:
-                    continue
-                last_bar_time[s][tf] = last
-                updated_any = True
-
-                feats = build_features(df.iloc[:-1])  # closed bar only
-                if feats.empty:
-                    continue
-                p_tech = prob_up_from_feats(feats)
-
-                # Get final decision with sentiment and fundamentals
-                p_final, trade_allowed, features = get_final_trade_decision(
-                    p_tech, s, currency_sentiment, upcoming_events
-                )
-
-                if not trade_allowed:
-                    if open_side[s] != 0:
-                        logger.warning(f"[{s}] Closing position due to upcoming event.")
-                        if not DRY_RUN:
-                            close_result = close_symbol_positions(s)
-                            if close_result.get("closed_tickets"):
-                                pending_alerts.update(close_result["closed_tickets"])
-                        last_close_time[s] = now_utc()
-                        open_side[s] = 0
-                        trades_today[s] += 1
-                    tf_side[s][tf] = 0 # Prevent new trades
+            for s in symbols:
+                if trades_today[s] >= max_trades_day:
                     continue
 
-                tf_probs[tf] = p_final
-                tf_atr[tf]   = float(feats["atr14"].iloc[-1])
+                tf_probs = {}
+                tf_atr   = {}
+                updated_any = False
 
-                # Optional debug:
-                # logger.debug(f"{s}/{tf}: p_tech={p_tech:.2f} p_final={p_final:.2f} emaΔ={feats['ema50'].iloc[-1]-feats['ema200'].iloc[-1]:.5f} "
-                #              f"macd={feats['macd_hist'].iloc[-1]:.6f} rsi={feats['rsi14'].iloc[-1]:.1f}")
+                for tf in tfs:
+                    df = fetch_bars(s, tf_codes[tf], count=400)  # ~33h on M5
+                    if df.empty or len(df) < 200:
+                        continue
+                    last = df.index[-1]
+                    if last == last_bar_time[s][tf]:
+                        continue
+                    last_bar_time[s][tf] = last
+                    updated_any = True
 
-                if p_final >= enter_thresh:
-                    tf_side[s][tf] = +1
-                elif p_final <= 1.0 - enter_thresh:
-                    tf_side[s][tf] = -1
+                    feats = build_features(df.iloc[:-1])  # closed bar only
+                    if feats.empty:
+                        continue
+                    p_tech = prob_up_from_feats(feats)
+
+                    # Get final decision with sentiment and fundamentals
+                    p_final, trade_allowed, features = get_final_trade_decision(
+                        p_tech, s, local_sentiment, local_events
+                    )
+
+                    if not trade_allowed:
+                        if open_side[s] != 0:
+                            logger.warning(f"[{s}] Closing position due to upcoming event.")
+                            if not DRY_RUN:
+                                close_result = close_symbol_positions(s)
+                                if close_result.get("closed_tickets"):
+                                    pending_alerts.update(close_result["closed_tickets"])
+                            last_close_time[s] = now_utc()
+                            open_side[s] = 0
+                            trades_today[s] += 1
+                        tf_side[s][tf] = 0 # Prevent new trades
+                        continue
+
+                    tf_probs[tf] = p_final
+                    tf_atr[tf]   = float(feats["atr14"].iloc[-1])
+
+                    if p_final >= enter_thresh:
+                        tf_side[s][tf] = +1
+                    elif p_final <= 1.0 - enter_thresh:
+                        tf_side[s][tf] = -1
+                    else:
+                        tf_side[s][tf] = 0
+
+                if not updated_any:
+                    continue
+
+                # Combine TFs
+                sides = [tf_side[s][tf] for tf in tfs]
+                if REQUIRE_CONSENSUS and len(tfs) > 1:
+                    nonzero = [x for x in sides if x != 0]
+                    if len(set(nonzero)) == 1 and nonzero:
+                        raw_side = nonzero[0]
+                        size_factor = 1.0
+                    else:
+                        raw_side = 0
+                        size_factor = 0.0
                 else:
-                    tf_side[s][tf] = 0
+                    nonzero = [x for x in sides if x != 0]
+                    if nonzero:
+                        raw_side = nonzero[0]
+                        size_factor = 1.0
+                    else:
+                        raw_side = 0
+                        size_factor = 0.0
 
-            if not updated_any:
-                continue
+                atr_vals= [v for v in tf_atr.values() if v is not None]
+                if not atr_vals:
+                    continue
+                atr_use = atr_vals[-1]
 
-            # Combine TFs
-            sides = [tf_side[s][tf] for tf in tfs]
-            if REQUIRE_CONSENSUS and len(tfs) > 1:
-                nonzero = [x for x in sides if x != 0]
-                if len(set(nonzero)) == 1 and nonzero:
-                    raw_side = nonzero[0]
-                    size_factor = 1.0
+                # Hysteresis / hold / cooldown
+                nowt = now_utc()
+                held_min = (nowt - last_open_time[s]).total_seconds() / 60.0
+                cool_min = (nowt - last_close_time[s]).total_seconds() / 60.0
+                conf = float(np.median(list(tf_probs.values()))) if tf_probs else 0.5
+
+                current = open_side[s]
+                desired = current
+
+                if current == 0:
+                    if cool_min >= cooldown_min:
+                        if raw_side > 0 and conf >= enter_thresh:
+                            desired = +1
+                        elif raw_side < 0 and conf >= enter_thresh:
+                            desired = -1
                 else:
-                    raw_side = 0
-                    size_factor = 0.0
-            else:
-                nonzero = [x for x in sides if x != 0]
-                if nonzero:
-                    raw_side = nonzero[0]
-                    size_factor = 1.0
-                else:
-                    raw_side = 0
-                    size_factor = 0.0
+                    if held_min >= min_hold_min:
+                        if conf <= exit_thresh or raw_side == 0:
+                            desired = 0
+                        elif raw_side != current and conf >= enter_thresh:
+                            desired = raw_side
 
-            atr_vals= [v for v in tf_atr.values() if v is not None]
-            if not atr_vals:
-                continue
-            atr_use = atr_vals[-1]
+                # ---------------- Execute if change ----------------
+                if desired == current:
+                    continue
 
-            # Hysteresis / hold / cooldown
-            nowt = now_utc()
-            held_min = (nowt - last_open_time[s]).total_seconds() / 60.0
-            cool_min = (nowt - last_close_time[s]).total_seconds() / 60.0
-            conf = float(np.median(list(tf_probs.values()))) if tf_probs else 0.5
+                if desired == 0:
+                    if current != 0 and not DRY_RUN:
+                        close_result = close_symbol_positions(s)
+                        if close_result.get("closed_tickets"):
+                            pending_alerts.update(close_result["closed_tickets"])
+                    logger.info(f"{s}: FLAT (held {held_min:.1f}m)")
+                    last_close_time[s] = nowt
+                    open_side[s] = 0
+                    trades_today[s] += 1
+                    continue
 
-            current = open_side[s]
-            desired = current
-
-            if current == 0:
-                if cool_min >= cooldown_min:
-                    if raw_side > 0 and conf >= enter_thresh:
-                        desired = +1
-                    elif raw_side < 0 and conf >= enter_thresh:
-                        desired = -1
-            else:
-                if held_min >= min_hold_min:
-                    if conf <= exit_thresh or raw_side == 0:
-                        desired = 0
-                    elif raw_side != current and conf >= enter_thresh:
-                        desired = raw_side
-
-            # ---------------- Execute if change ----------------
-            if desired == current:
-                continue
-
-            if desired == 0:
-                if current != 0 and not DRY_RUN:
+                # Flip first if needed
+                if current != 0 and desired != current and not DRY_RUN:
                     close_result = close_symbol_positions(s)
                     if close_result.get("closed_tickets"):
                         pending_alerts.update(close_result["closed_tickets"])
-                logger.info(f"{s}: FLAT (held {held_min:.1f}m)")
-                last_close_time[s] = nowt
-                open_side[s] = 0
-                trades_today[s] += 1
-                continue
+                    last_close_time[s] = nowt
 
-            # Flip first if needed
-            if current != 0 and desired != current and not DRY_RUN:
-                close_result = close_symbol_positions(s)
-                if close_result.get("closed_tickets"):
-                    pending_alerts.update(close_result["closed_tickets"])
-                last_close_time[s] = nowt
-
-            # Live tick anchor for SL/TP & risk sizing
-            tick_now = mt5.symbol_info_tick(s)
-            if not tick_now:
-                logger.warning(f"{s}: no tick, skipping")
-                continue
-            entry_price = tick_now.ask if desired > 0 else tick_now.bid
-
-            sl, tp = calc_sl_tp(desired, entry_price, atr_use, sl_mult, tp_mult)
-            sl, tp = enforce_min_distance(s, desired, entry_price, sl, tp)
-
-            stop_dist = abs(entry_price - sl)
-            equity = account_equity()
-
-            lots_base = lots_for_risk(s, equity, stop_dist, trade_bps)
-            lots = max(round(lots_base * size_factor, 3), 0.01)
-
-            if SKIP_IF_MINLOTS_EXCEEDS_RISK:
-                risk_target = risk_dollars_from_bps(equity, trade_bps) * RISK_TOLERANCE_MULTIPLIER
-                est_risk = estimate_risk_dollars(s, lots, stop_dist)
-                if est_risk > risk_target + 1e-9:
-                    logger.info(f"{s}: SKIP — min lot risk ${est_risk:.2f} > target ${risk_target:.2f} "
-                                f"(stop={stop_dist:.5f}, lots={lots})")
+                # Live tick anchor for SL/TP & risk sizing
+                tick_now = mt5.symbol_info_tick(s)
+                if not tick_now:
+                    logger.warning(f"{s}: no tick, skipping")
                     continue
+                entry_price = tick_now.ask if desired > 0 else tick_now.bid
 
-            resp = {"ok": True, "retcode": "DRY", "comment": "simulated", "deal_id": None} if DRY_RUN \
-                   else place_market_order(s, desired, lots, sl=sl, tp=tp)
+                sl, tp = calc_sl_tp(desired, entry_price, atr_use, sl_mult, tp_mult)
+                sl, tp = enforce_min_distance(s, desired, entry_price, sl, tp)
 
-            logger.info(f"{s}: {'LONG' if desired>0 else 'SHORT'} lots={lots:.2f} "
-                        f"SL={sl:.5f} TP={tp:.5f} (risk {trade_bps}bps) resp={resp}")
+                stop_dist = abs(entry_price - sl)
+                equity = account_equity()
 
-            if resp.get("ok") and resp.get("deal_id"):
-                time.sleep(0.5) # Give a moment for the deal to be recorded in history
-                deal = mt5.history_deals_get(ticket=resp["deal_id"])
-                if deal and len(deal) == 1:
-                    position_id = deal[0].position_id
+                lots_base = lots_for_risk(s, equity, stop_dist, trade_bps)
+                lots = max(round(lots_base * size_factor, 3), 0.01)
 
-                    # Log the trade decision context
-                    log_features = features.copy()
-                    log_features.update({
-                        'rsi14': feats["rsi14"].iloc[-1],
-                        'macd_hist': feats["macd_hist"].iloc[-1],
-                        'rv96': feats["rv96"].iloc[-1],
-                        'ema_dist_norm': (feats["ema50"].iloc[-1] - feats["ema200"].iloc[-1]) / (float(feats["rv96"].iloc[-1]) + 1e-9),
-                    })
-                    trade_logger.log_open_trade(position_id, s, desired, lots, entry_price, sl, tp, log_features)
-                else:
-                    logger.warning(f"[{s}] Could not retrieve deal details for deal_id {resp['deal_id']} to log trade open.")
+                if SKIP_IF_MINLOTS_EXCEEDS_RISK:
+                    risk_target = risk_dollars_from_bps(equity, trade_bps) * RISK_TOLERANCE_MULTIPLIER
+                    est_risk = estimate_risk_dollars(s, lots, stop_dist)
+                    if est_risk > risk_target + 1e-9:
+                        logger.info(f"{s}: SKIP — min lot risk ${est_risk:.2f} > target ${risk_target:.2f} "
+                                    f"(stop={stop_dist:.5f}, lots={lots})")
+                        continue
 
-            last_open_time[s] = nowt
-            open_side[s] = desired
-            trades_today[s] += 1
+                resp = {"ok": True, "retcode": "DRY", "comment": "simulated", "deal_id": None} if DRY_RUN \
+                       else place_market_order(s, desired, lots, sl=sl, tp=tp)
 
-        time.sleep(30)  # ~2 checks per minute on M5
+                logger.info(f"{s}: {'LONG' if desired>0 else 'SHORT'} lots={lots:.2f} "
+                            f"SL={sl:.5f} TP={tp:.5f} (risk {trade_bps}bps) resp={resp}")
+
+                if resp.get("ok") and resp.get("deal_id"):
+                    time.sleep(0.5) # Give a moment for the deal to be recorded in history
+                    deal = mt5.history_deals_get(ticket=resp["deal_id"])
+                    if deal and len(deal) == 1:
+                        position_id = deal[0].position_id
+
+                        # Log the trade decision context
+                        log_features = features.copy()
+                        log_features.update({
+                            'rsi14': feats["rsi14"].iloc[-1],
+                            'macd_hist': feats["macd_hist"].iloc[-1],
+                            'rv96': feats["rv96"].iloc[-1],
+                            'ema_dist_norm': (feats["ema50"].iloc[-1] - feats["ema200"].iloc[-1]) / (float(feats["rv96"].iloc[-1]) + 1e-9),
+                        })
+                        trade_logger.log_open_trade(position_id, s, desired, lots, entry_price, sl, tp, log_features)
+                    else:
+                        logger.warning(f"[{s}] Could not retrieve deal details for deal_id {resp['deal_id']} to log trade open.")
+
+                last_open_time[s] = nowt
+                open_side[s] = desired
+                trades_today[s] += 1
+
+            time.sleep(30)  # ~2 checks per minute on M5
+
+    except KeyboardInterrupt:
+        logger.info("Shutdown signal received.")
+    finally:
+        stop_event.set()
+        if 'worker_thread' in locals() and worker_thread.is_alive():
+            logger.info("Waiting for background worker to stop...")
+            worker_thread.join()
+        mt5.shutdown()
+        logger.info("MT5 connection shut down. Bot stopped.")
 
 if __name__ == "__main__":
     main()
