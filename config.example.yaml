@@ -1,25 +1,39 @@
-# FX AI Bot Configuration Example
-# Copy this file to config.yaml and modify as needed.
-symbols: ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCHF"]
-timeframes: ["M5"]
+broker:
+  name: MT5
+
+symbols: ["EURUSD","GBPUSD","USDJPY"]   # keep it to 3 tight pairs
+
+timeframes: ["M5"]        # M5 only
+
 risk:
-  max_risk_per_trade_bps: 100
-  stop_atr_mult: 1.8
-  takeprofit_atr_mult: 2.6
+  max_risk_per_trade_bps: 80           # 0.8% of equity per trade, fewer skips
+  stop_atr_mult: 2.0                   # a bit wider SL, lets trades breathe
+  takeprofit_atr_mult: 3.0             # wider TP, aiming for ~1:1.5 RR
+
   kill_switch:
-    max_intraday_drawdown_pct: 2.0
+    max_intraday_drawdown_pct: 4.0     # give bot room for volatility
     max_daily_trades_per_symbol: 6
-strategy:
-  enter_thresh: 0.62
-  exit_thresh: 0.55
-  min_hold_min: 15
-  cooldown_min: 10
+
 trading_window:
   enabled: true
-  start_hour_utc: 6
-  end_hour_utc: 20
+  start_hour_utc: 6                    # London open-ish
+  end_hour_utc: 20                     # London/NY overlap
+
+strategy:
+  enter_thresh: 0.58   # looser than 0.62 → more shorts will pass
+  exit_thresh: 0.45
+  min_hold_min: 30
+  cooldown_min: 10
+  require_entry_confirmation: false    # If true, waits for a confirming candle before entering
+
+
 alerts:
   telegram_enabled: true
   telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
   telegram_chat_id_env: "TELEGRAM_CHAT_ID"
-  alert_on_trade_close: true
+
+api_keys:
+  alpha_vantage_api_key_env: "AV_API_KEY" # Name of the env var for the Alpha Vantage key
+
+costs:
+  spread_bps_default: 1.2
