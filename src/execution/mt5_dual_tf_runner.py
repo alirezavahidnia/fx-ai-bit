@@ -440,11 +440,20 @@ def main():
 
         if pending_alerts:
             deals = mt5.history_deals_get(day_start, nowt_loop) or []
-            processed = {d.position_id for d in deals if d.position_id in pending_alerts and d.entry == mt5.DEAL_ENTRY_OUT and (
-                trade_logger.log_close_trade(d.position_id, d.profit + d.commission + d.swap),
-                send_telegram_alert(cfg, format_trade_close_alert(d)) if cfg.get("alerts",{}).get("alert_on_trade_close") else True
-            )}
-            pending_alerts.difference_update(processed)
+            processed_deals = set()
+            if deals:
+                for d in deals:
+                    if d.position_id in pending_alerts and d.entry == mt5.DEAL_ENTRY_OUT:
+                        pnl = d.profit + d.commission + d.swap
+                        trade_logger.log_close_trade(d.position_id, pnl)
+
+                        if cfg.get("alerts", {}).get("alert_on_trade_close"):
+                            send_telegram_alert(cfg, format_trade_close_alert(d))
+
+                        processed_deals.add(d.position_id)
+
+            if processed_deals:
+                pending_alerts.difference_update(processed_deals)
 
         if nowt_loop >= day_start + dt.timedelta(days=1):
             summary = build_daily_summary(day_start, nowt_loop, symbols)
@@ -575,7 +584,9 @@ def main():
 
             # Entry logic
             if current != 0 and not DRY_RUN: # Flip existing position
-                close_symbol_positions(s)
+                res = close_symbol_positions(s)
+                if res.get("closed_tickets"):
+                    pending_alerts.update(res["closed_tickets"])
 
             if require_entry_confirmation:
                 pending_signal[s] = {
