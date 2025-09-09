@@ -52,6 +52,7 @@ class TradeLogger:
         Finds the trade opening row by position_id, updates it with the PNL,
         and marks it as closed using a safe, atomic write.
         """
+        logger.debug(f"Attempting to log close for position_id: {position_id} with PNL: {pnl}")
         with self.lock:
             # Prevent trying to log a close if the file doesn't exist or is empty.
             if not os.path.exists(self.filepath) or os.path.getsize(self.filepath) == 0:
@@ -62,15 +63,23 @@ class TradeLogger:
             try:
                 # Use dtype to ensure correct matching and handle potential NaNs in position_id column
                 df = pd.read_csv(self.filepath, dtype={'position_id': 'Int64'})
+                logger.debug(f"Trade log CSV loaded. Shape: {df.shape}. Columns: {df.columns.tolist()}")
 
                 mask = (df['position_id'] == position_id) & (df['event_type'] == 'open')
 
+                num_found = mask.sum()
+                logger.debug(f"Searching for open trade with position_id {position_id}. Found {num_found} matching rows.")
+
                 if not mask.any():
                     logger.warning(f"Could not find opening log for position {position_id} to record PNL.")
+                    # Log first 5 position IDs for debugging
+                    if not df.empty:
+                        logger.debug(f"Existing position_ids in log: {df['position_id'].unique()[:5]}")
                     return
 
                 # In case of duplicates (e.g., bot restart), update the last open entry
                 idx = df.index[mask].tolist()[-1]
+                logger.debug(f"Updating row at index {idx} for position_id {position_id}.")
                 df.loc[idx, 'pnl'] = pnl
                 df.loc[idx, 'event_type'] = 'closed'
 

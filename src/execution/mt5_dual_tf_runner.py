@@ -439,11 +439,19 @@ def main():
         nowt_loop = now_utc()
 
         if pending_alerts:
+            logger.debug(f"Checking for closed deals. Pending alerts for IDs: {pending_alerts}")
             deals = mt5.history_deals_get(day_start, nowt_loop) or []
+            logger.debug(f"Found {len(deals)} deals in history since {day_start}.")
+
             processed_deals = set()
             if deals:
                 for d in deals:
+                    # Log details for every deal that might be relevant
+                    if d.position_id in pending_alerts:
+                        logger.debug(f"Found deal for pending position {d.position_id}: DealTicket={d.ticket}, Type={d.type}, Entry={d.entry}")
+
                     if d.position_id in pending_alerts and d.entry == mt5.DEAL_ENTRY_OUT:
+                        logger.debug(f"MATCH FOUND for position {d.position_id}. This is a closing deal. Logging PNL.")
                         pnl = d.profit + d.commission + d.swap
                         trade_logger.log_close_trade(d.position_id, pnl)
 
@@ -453,6 +461,7 @@ def main():
                         processed_deals.add(d.position_id)
 
             if processed_deals:
+                logger.debug(f"Processed and removing deal IDs: {processed_deals}")
                 pending_alerts.difference_update(processed_deals)
 
         if nowt_loop >= day_start + dt.timedelta(days=1):
@@ -467,7 +476,9 @@ def main():
             if not DRY_RUN:
                 for s in symbols:
                     res = close_symbol_positions(s)
-                    if res.get("closed_tickets"): pending_alerts.update(res["closed_tickets"])
+                    if res.get("closed_tickets"):
+                        logger.debug(f"KILL SWITCH: Staging tickets for PNL logging: {res.get('closed_tickets')}")
+                        pending_alerts.update(res["closed_tickets"])
             paused_for_dd = True
             logger.error(f"⛔ KILL-SWITCH: DD {dd_pct:.2f}% hit. Paused until next day.")
         if paused_for_dd or not within_trading_window(cfg):
@@ -577,7 +588,9 @@ def main():
             if desired == 0: # Exit logic
                 if current != 0 and not DRY_RUN:
                     res = close_symbol_positions(s)
-                    if res.get("closed_tickets"): pending_alerts.update(res["closed_tickets"])
+                    if res.get("closed_tickets"):
+                        logger.debug(f"EXIT SIGNAL: Staging tickets for PNL logging: {res.get('closed_tickets')}")
+                        pending_alerts.update(res["closed_tickets"])
                 open_side[s], last_close_time[s] = 0, nowt_loop
                 if s in pending_signal: pending_signal.pop(s) # Clear any pending signals too
                 continue
@@ -586,6 +599,7 @@ def main():
             if current != 0 and not DRY_RUN: # Flip existing position
                 res = close_symbol_positions(s)
                 if res.get("closed_tickets"):
+                    logger.debug(f"FLIP SIGNAL: Staging tickets for PNL logging: {res.get('closed_tickets')}")
                     pending_alerts.update(res["closed_tickets"])
 
             if require_entry_confirmation:
