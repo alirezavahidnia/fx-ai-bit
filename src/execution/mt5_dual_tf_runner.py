@@ -153,7 +153,7 @@ def get_final_trade_decision(
     event_window_seconds = 3600  # Block trades 1h before a high-impact event
     for event in current_events:
         event_time = event.get('datetime_utc')
-        if event.get('impact') == 'High' and event_time:
+        if event.get('importance') == 'High' and event_time:
             time_diff_seconds = (event_time - now).total_seconds()
             # Block if event is in the next hour or happened in the last 15 mins
             if -900 < time_diff_seconds < event_window_seconds:

@@ -24,8 +24,8 @@ def get_economic_calendar(countries: list = None):
         if df.empty:
             return []
 
-        # We only need a few columns
-        df = df[['date', 'time', 'event', 'impact']].copy()
+        # We only need a few columns, using the correct 'importance' column name
+        df = df[['date', 'time', 'event', 'importance']].copy()
 
         # The date from investpy is 'dd/mm/yyyy'. Filter for today UTC.
         today_str = datetime.now(timezone.utc).strftime('%d/%m/%Y')
@@ -43,7 +43,7 @@ def get_economic_calendar(countries: list = None):
         ).dt.tz_localize('UTC')
 
         # Return relevant columns as a list of dictionaries
-        return df[['datetime_utc', 'event', 'impact']].to_dict('records')
+        return df[['datetime_utc', 'event', 'importance']].to_dict('records')
 
     except Exception as e:
         logger.exception(f"Failed to fetch or process economic calendar: {e}")
