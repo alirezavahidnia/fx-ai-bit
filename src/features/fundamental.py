@@ -2,11 +2,25 @@ import investpy
 import pandas as pd
 from loguru import logger
 from datetime import datetime, timezone
+from threading import Thread
+from queue import Queue
 
-def get_economic_calendar(countries: list = None):
+def _fetch_investpy_in_thread(q: Queue, countries: list, importances: list, time_zone: str):
+    """Helper function to run the blocking investpy call in a thread."""
+    try:
+        result = investpy.economic_calendar(
+            countries=countries,
+            importances=importances,
+            time_zone=time_zone
+        )
+        q.put(result)
+    except Exception as e:
+        q.put(e)
+
+def get_economic_calendar(countries: list = None, timeout_seconds: int = 30):
     """
-    Fetches high-impact economic calendar events for the current day from major economies.
-    Uses GMT/UTC for time.
+    Fetches high-impact economic calendar events with a hard timeout
+    to prevent the call from hanging indefinitely.
     """
     if countries is None:
         countries = [
@@ -15,39 +29,42 @@ def get_economic_calendar(countries: list = None):
         ]
 
     try:
-        # Fetch high-impact events for today
-        df = investpy.economic_calendar(
-            countries=countries,
-            importances=['high'],
-            time_zone='GMT'
+        q = Queue()
+        thread = Thread(
+            target=_fetch_investpy_in_thread,
+            args=(q, countries, ['high'], 'GMT')
         )
+        thread.daemon = True
+        thread.start()
+        thread.join(timeout=timeout_seconds)
+
+        if thread.is_alive():
+            logger.warning(f"investpy call timed out after {timeout_seconds} seconds.")
+            return []
+
+        result = q.get()
+        if isinstance(result, Exception):
+            raise result # Re-raise exception from the thread to be logged
+
+        df = result
         if df.empty:
             return []
 
-        # We only need a few columns, using the correct 'importance' column name
         df = df[['date', 'time', 'event', 'importance']].copy()
-
-        # The date from investpy is 'dd/mm/yyyy'. Filter for today UTC.
         today_str = datetime.now(timezone.utc).strftime('%d/%m/%Y')
         df = df[df['date'] == today_str]
 
-        # Ignore 'All Day' events as they don't have a specific time
         df = df[df['time'] != 'All Day']
         if df.empty:
             return []
 
-        # Create a proper UTC datetime object for easier comparison
         df['datetime_utc'] = pd.to_datetime(
             df['date'] + ' ' + df['time'],
             format='%d/%m/%Y %H:%M'
         ).dt.tz_localize('UTC')
 
-        # Return relevant columns as a list of dictionaries
         return df[['datetime_utc', 'event', 'importance']].to_dict('records')
 
     except Exception as e:
         logger.exception(f"Failed to fetch or process economic calendar: {e}")
-        # investpy is known to have connection issues sometimes
-        if "Max retries exceeded" in str(e) or "ECONNRESET" in str(e):
-            logger.error("investpy failed with a connection error, which is a known issue. Skipping this cycle.")
         return []
