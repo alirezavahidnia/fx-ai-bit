@@ -13,13 +13,21 @@ def fetch_news_sentiments(api_key: str, symbols: list[str]) -> dict:
         logger.warning("Alpha Vantage API key not provided. Skipping news fetch.")
         return {}
 
-    # The API takes Forex pairs like 'EURUSD' as tickers.
-    # It also supports general topics like 'FOREX'.
-    tickers = "FOREX," + ",".join(symbols)
+    # For Forex pairs, we can use the FOREX topic and the symbols as tickers.
+    # For Gold (XAUUSD), news is more related to broader economic topics.
+    forex_symbols = [s for s in symbols if "USD" in s and s != "XAUUSD"] # A simple filter for forex pairs
+
+    # Broad topics relevant to all assets, especially commodities
+    topics = "financial_markets,economy_macro,finance"
+
+    # Build the tickers string, including a general FOREX topic ticker
+    tickers_list = ["FOREX"] + forex_symbols
+    tickers_str = ",".join(tickers_list)
 
     url = (
         f'https://www.alphavantage.co/query?function=NEWS_SENTIMENT'
-        f'&tickers={tickers}'
+        f'&tickers={tickers_str}'
+        f'&topics={topics}'
         f'&apikey={api_key}'
         f'&limit=50'  # Fetch last 50 relevant articles
     )
