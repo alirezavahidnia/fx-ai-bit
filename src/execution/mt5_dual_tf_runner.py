@@ -188,13 +188,25 @@ def symbol_info_or_raise(symbol: str):
     if not info.visible: mt5.symbol_select(symbol, True)
     return info
 
-def close_symbol_positions(symbol: str) -> dict:
+def close_symbol_positions(symbol: str, trade_logger: TradeLogger) -> dict:
+    """
+    Closes all open positions for a given symbol.
+    Crucially, it logs the final PNL *before* sending the close order.
+    """
     positions = mt5.positions_get(symbol=symbol)
     if positions is None:
         logger.error(f"positions_get({symbol}) failed: {mt5.last_error()}")
         return {"ok": False, "msg": str(mt5.last_error()), "closed_tickets": []}
-    if not positions: return {"ok": True, "msg": "no positions", "closed_tickets": []}
+    if not positions:
+        return {"ok": True, "msg": "no positions", "closed_tickets": []}
 
+    # --- New PNL Logging Logic ---
+    # Log the PNL of each position right before we close it.
+    for pos in positions:
+        # The `pos.profit` gives the current floating P/L. This is the most reliable way to get the final PNL.
+        trade_logger.log_close_trade(pos.ticket, pos.profit)
+
+    # --- Proceed with closing the positions ---
     tick = mt5.symbol_info_tick(symbol)
     results, closed_tickets = [], [pos.ticket for pos in positions]
     for pos in positions:
@@ -415,7 +427,6 @@ def main():
     trades_today = {s: 0 for s in symbols}
     last_open_time = {s: now_utc() - dt.timedelta(days=99) for s in symbols}
     last_close_time = {s: now_utc() - dt.timedelta(days=99) for s in symbols}
-    pending_alerts = set()
     pending_signal: Dict[str, Dict[str, Any]] = {} # For entry confirmation feature
     trade_logger = TradeLogger()
 
@@ -438,23 +449,6 @@ def main():
     while True:
         nowt_loop = now_utc()
 
-        if pending_alerts:
-            deals = mt5.history_deals_get(day_start, nowt_loop) or []
-            processed_deals = set()
-            if deals:
-                for d in deals:
-                    if d.position_id in pending_alerts and d.entry == mt5.DEAL_ENTRY_OUT:
-                        pnl = d.profit + d.commission + d.swap
-                        trade_logger.log_close_trade(d.position_id, pnl)
-
-                        if cfg.get("alerts", {}).get("alert_on_trade_close"):
-                            send_telegram_alert(cfg, format_trade_close_alert(d))
-
-                        processed_deals.add(d.position_id)
-
-            if processed_deals:
-                pending_alerts.difference_update(processed_deals)
-
         if nowt_loop >= day_start + dt.timedelta(days=1):
             summary = build_daily_summary(day_start, nowt_loop, symbols)
             send_telegram_alert(cfg, format_daily_summary(day_start, nowt_loop, summary))
@@ -466,9 +460,7 @@ def main():
         if dd_pct <= -abs(daily_dd_max) and not paused_for_dd:
             if not DRY_RUN:
                 for s in symbols:
-                    res = close_symbol_positions(s)
-                    if res.get("closed_tickets"):
-                        pending_alerts.update(res["closed_tickets"])
+                    close_symbol_positions(s, trade_logger)
             paused_for_dd = True
             logger.error(f"⛔ KILL-SWITCH: DD {dd_pct:.2f}% hit. Paused until next day.")
         if paused_for_dd or not within_trading_window(cfg):
@@ -584,18 +576,14 @@ def main():
 
             if desired == 0: # Exit logic
                 if current != 0 and not DRY_RUN:
-                    res = close_symbol_positions(s)
-                    if res.get("closed_tickets"):
-                        pending_alerts.update(res["closed_tickets"])
+                    close_symbol_positions(s, trade_logger)
                 open_side[s], last_close_time[s] = 0, nowt_loop
                 if s in pending_signal: pending_signal.pop(s) # Clear any pending signals too
                 continue
 
             # Entry logic
             if current != 0 and not DRY_RUN: # Flip existing position
-                res = close_symbol_positions(s)
-                if res.get("closed_tickets"):
-                    pending_alerts.update(res["closed_tickets"])
+                close_symbol_positions(s, trade_logger)
 
             if require_entry_confirmation:
                 pending_signal[s] = {
