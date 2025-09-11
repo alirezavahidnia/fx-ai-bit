@@ -38,7 +38,7 @@ def fetch_news_sentiments(api_key: str, symbols: list[str]) -> dict:
         data = response.json()
 
         if "feed" not in data or not data["feed"]:
-            logger.info(f"No news found for tickers: {tickers}")
+            logger.info(f"No news found for tickers: {tickers_str}")
             return {}
 
         # Process the feed to get an average sentiment per ticker
