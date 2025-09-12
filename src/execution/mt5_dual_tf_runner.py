@@ -563,8 +563,12 @@ def main():
 
             if current == 0:
                 if (nowt_loop - last_close_time[s]).total_seconds() / 60.0 >= cooldown_min:
-                    if raw_side > 0 and p_up >= enter_thresh: desired = +1
-                    elif raw_side < 0 and p_down >= enter_thresh: desired = -1
+                    # Momentum Agreement Filter: require macd_hist to align with trade direction
+                    macd_hist = last_feats["macd_hist"].iloc[-1]
+                    if raw_side > 0 and p_up >= enter_thresh and macd_hist > 0:
+                        desired = +1
+                    elif raw_side < 0 and p_down >= enter_thresh and macd_hist < 0:
+                        desired = -1
             elif (nowt_loop - last_open_time[s]).total_seconds() / 60.0 >= min_hold_min:
                 if current > 0 and (p_up < exit_thresh or p_down >= enter_thresh): desired = 0
                 elif current < 0 and (p_down < exit_thresh or p_up >= enter_thresh): desired = 0
