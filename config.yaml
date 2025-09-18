@@ -24,12 +24,16 @@ strategy:
   exit_thresh: 0.45
   min_hold_min: 30
   cooldown_min: 10
+  require_entry_confirmation: false    # If true, waits for a confirming candle before entering
 
 
 alerts:
   telegram_enabled: true
   telegram_bot_token_env: "TELEGRAM_BOT_TOKEN"
   telegram_chat_id_env: "TELEGRAM_CHAT_ID"
+
+api_keys:
+  alpha_vantage_api_key_env: "AV_API_KEY" # Name of the env var for the Alpha Vantage key
 
 costs:
   spread_bps_default: 1.2
